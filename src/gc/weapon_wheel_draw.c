@@ -1,0 +1,111 @@
+/* SPDX-License-Identifier: GPL-3.0-only
+ *
+ * COPIED from Going Commando's decompilation: OpenRAC/rac2-decomp
+ * (https://github.com/OpenRAC/rac2-decomp, GNU GPL version 3) at commit
+ * 4ea93ceaf43aec055e19211d36512e847860bac2, file src/game/0028BDB0-wheel-g8.c,
+ * lines 1-43 and 56-102 (all but the ring's lines 44-55). Code of that project from before its relicensing (d46a3539, 2026-10-11) is also
+ * under its MIT notice: THIRD_PARTY_NOTICES.md.
+ *
+ * weapon_wheel_draw (USA v1.01 func_0028C6D0): the weapon quick select's draw callback: the ring,
+ * then the selected weapon's ammo and name.
+ *
+ * The copied lines are unchanged. The lines marked (gc-weapon-wheel) are this mod's: Ratchet & Clank's ring in place of Going
+ * Commando's. Every name the copied lines use that is not
+ * defined in src/gc/ is the translation layer's (gc/shim/common.h, gc/rac1_shim.cpp): Going
+ * Commando's globals and functions in Ratchet & Clank's terms.
+ */
+#include "common.h"
+
+/* Weapon wheel. One scratch int holds the colour and then the name's length: the reassignment is why cprop leaves retail's copy into the colour register. */
+#define F(p,t,o) (*(t *)((char *)(p)+(o)))
+extern float IntToFloat(int);
+extern int FloatToInt(float);
+extern float FastAddRotations(float,float);
+extern void menu_show_colored_label(void *,int,float);
+extern int hud_is_open_done(void);
+extern int hud_screen_position(void *,int *,int *);
+extern int sprintf(char *,char *,...);
+extern unsigned int FastTweenColor(unsigned int,unsigned int,float);
+extern int text_draw_centered_small(int,int,unsigned int,char *,int);
+extern char *GetLocalizedString(int);
+extern unsigned int func_001157AC(const char *);
+extern int g_radial_slot_count;
+extern char **g_radial_menu_pages;
+extern int g_radial_menu_page_index __attribute__((sda));
+extern int g_notice_owner __attribute__((sda));
+extern char *g_resident_data_base __attribute__((sda));
+extern unsigned char g_item_slot_to_record[];
+extern int g_weapon_menu_slots[] MACRO_ADDR;
+extern int g_item_ammo_counts[];
+typedef struct { int active; char reserved04[0x44]; short localizedName; char reserved4A[0x3E]; unsigned short sellsAmmo; char reserved8A[4]; unsigned short ammoCapacity; char reserved90[0x50]; } WheelWeaponRecord;
+extern WheelWeaponRecord g_weapon_l00_table[];
+extern char g_str_ammo_format[];
+/* Draws the weapon wheel: highlights the selected slot and prints its ammo count and name. */
+int weapon_wheel_draw(char *menu)
+{
+    float menu_fade,selection_fade;
+    int alpha,x,y,i,selected,split,j,len,text_y;
+    unsigned int scratch;
+    char buffer[80], *text,*tail;
+    WheelWeaponRecord *record;
+    unsigned char *fade=(unsigned char *)menu+0x70;
+    menu_fade=IntToFloat(fade[0])/IntToFloat(8);
+    if(menu_fade>1.0f) menu_fade=1.0f; else if(menu_fade<0.0f) menu_fade=0.0f;
+    selection_fade=IntToFloat(fade[1])/IntToFloat(8);
+    if(selection_fade>1.0f) selection_fade=1.0f; else if(selection_fade<0.0f) selection_fade=0.0f;
+    alpha=FloatToInt(menu_fade*128.0f);
+    i=0;
+    x=F(menu,int,0x50); y=F(menu,int,0x54);
+    hud_screen_position(menu,&x,&y);
+    /* (gc-weapon-wheel) In place of lines 44-55, Going Commando's ring: its labels (menu_show_colored_label) and
+       alpha are its resident HUD's (g_resident_data_base + 0x376C8, + 0x38000 + 0x7354), which Ratchet
+       & Clank does not have. The layer draws Ratchet & Clank's own ring (its panel, icons and marker,
+       draw_hud_item_selector_panel's sprites) at this alpha: gc/rac1_shim.cpp, draw_ring. */
+    gc_shim_draw_ring(menu, x, y, alpha); /* (gc-weapon-wheel) */
+    selected=F(menu,int,0x74);
+    if(selected>=0 && F(g_radial_menu_pages[g_radial_menu_page_index]+selected*28,int,0) && !g_notice_owner) {
+        int n=g_weapon_menu_slots[selected], value;
+        float opacity;
+        record=&g_weapon_l00_table[g_item_slot_to_record[n]];
+        opacity=menu_fade*selection_fade;
+
+        if(record->active && record->sellsAmmo) {
+            value=g_item_ammo_counts[n];
+            sprintf(buffer,g_str_ammo_format,value,record->ammoCapacity);
+            {
+                unsigned int c;
+                if (value) c=FastTweenColor(0x00f0f0f0,0x80f0f0f0,opacity);
+                else c=FastTweenColor(0x004040ff,0x804040ff,opacity);
+                text_draw_centered_small(x+105,y+112,c,buffer,-1);
+            }
+        }
+        scratch=FastTweenColor(0x00f0f0f0,0x80f0f0f0,opacity);
+        split=0;
+        text=GetLocalizedString(g_weapon_l00_table[g_item_slot_to_record[F(g_radial_menu_pages[g_radial_menu_page_index]+selected*28,int,0x18)]].localizedName);
+        if(text && func_001157AC(text)) {
+            unsigned int color=scratch;
+            scratch=func_001157AC(text);
+            len=scratch;
+            tail=text;
+            for(j=0;j<len;j++) {
+                tail++;
+                if(*(unsigned char *)tail=='-') {tail++;split=j+2;break;}
+            }
+            if(!split) {
+                tail=text;
+                for(j=0;j<len;j++) {
+                    tail++;
+                    if(*(unsigned char *)tail==' ') {tail++;split=j+1;break;}
+                }
+            }
+            text_y=y+100;
+            if(g_weapon_l00_table[g_item_slot_to_record[g_weapon_menu_slots[selected]]].sellsAmmo) text_y=y+75;
+            else { int splitY=y+85; text_y=split ? splitY : text_y; }
+            if(split) {
+                text_draw_centered_small(x+105,text_y,color,text,split);
+                text_draw_centered_small(x+105,text_y+16,color,tail,-1);
+            } else text_draw_centered_small(x+105,text_y,color,text,-1);
+        }
+    }
+    return F(menu,int,0x58);
+}

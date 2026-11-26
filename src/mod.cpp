@@ -1,1490 +1,215 @@
-#include "openrac/mod.hpp"
-#include "openrac/games/rac1.hpp"
-#include "pause_legacy_shade.hpp"
-#include "pause_policy.hpp"
-#include "pause_veil.hpp"
-
-#include <array>
-#include <atomic>
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Weapon Wheel Pause (originally by Moritz Wallinger and glawks): Going Commando's weapon quick select in Ratchet & Clank, running
+// Going Commando's own code.
+//
+// The quick select is Going Commando's, copied (src/gc/*.c, from rac2-decomp): its update (the
+// stick's sectors, the d-pad's neighbours, the click, the commit as Triangle is let go), its draw
+// (the selected weapon's ammo and name; Ratchet & Clank's own ring), its init, and its pause: Triangle
+// pressed in play opens Going Commando's game mode 4 with modal mode 7 (the gate, then
+// UpdateModalState's case 7 and gfx_render_frame_extra_layers), which here runs in Ratchet & Clank's
+// game mode 4, the freeze mode, with a freeze kind of the mod's own. The translation layer
+// (src/gc/rac1_shim.hpp) runs it on Ratchet & Clank's memory and functions.
+//
+// Six hook points:
+//   rac1.level.update_play          game mode 0's tick: Going Commando's gate before it; when the
+//                                   gate opens the quick select, the tick is skipped (the world held)
+//   rac1.freeze.update              the freeze mode's tick: the mod's kind runs UpdateModalState
+//                                   (case 7), then the game's (the sound)
+//   rac1.freeze.draw                the freeze mode's picture: the mod's kind draws Going Commando's
+//                                   (the world and its HUD, no dialog)
+//   rac1.hud.quick_select.init      the quick select's HUD record: Going Commando's init,
+//   rac1.hud.quick_select.update    update and draw, paused or not ("Pause while open" off: Ratchet &
+//   rac1.hud.quick_select.draw      Clank's own Triangle opens it, Going Commando's code runs it)
+// The first three need OpenRAC with mod interface 1.39 and those hook points (sdk.lock's commit).
 #include <cstdint>
-#include <set>
+#include <cstdio>
+#include <cstring>
 #include <string>
-#include <vector>
+
+#include "openrac/games/rac1.hpp"
+#include "openrac/mod.hpp"
+
+#include "gc/rac1_shim.hpp"
+#include "layout.hpp"
 
 namespace {
 
-constexpr openrac::gaddr kPalMobyArrayGlobal = 0x00160018u;
-constexpr openrac::gaddr kNtscMobyArrayGlobal = 0x0015FF18u;
-constexpr openrac::gaddr kPalFrameTimeGlobal = 0x0015EE7Cu;
-constexpr openrac::gaddr kNtscFrameTimeGlobal = 0x0015ED7Cu;
-constexpr openrac::gaddr kMobySize = 0x100u;
-constexpr openrac::gaddr kMobyScale = 0x2Cu;
-constexpr openrac::gaddr kMobyFlags = 0x34u;
-constexpr openrac::gaddr kMobySpawnFrame = 0x38u;
-constexpr openrac::gaddr kMobyClass = 0xA6u;
-constexpr openrac::gaddr kMobyState = 0x20u;
-constexpr openrac::gaddr kMobyPvars = 0x78u;
-constexpr openrac::gaddr kBlackwaterWaterRecordIndex = 0x14u;
-constexpr openrac::gaddr kQuartuElectricLightSlot = 0x120u;
-constexpr openrac::gaddr kVendorRingPtr = 0x0Cu;
-constexpr openrac::gaddr kVendorGlowStrength = 0x90u;
-constexpr openrac::gaddr kVendorRingAQuaternion = 0x20u;
-constexpr openrac::gaddr kVendorRingBQuaternion = 0x60u;
-// Shared-level frame count. Forcing a non-multiple of eight in the scoped
-// visual update keeps the original vendor's proximity branch inactive.
-constexpr openrac::gaddr kPalLevelFrameCounter = 0x0015F6B0u;
-constexpr openrac::gaddr kNtscLevelFrameCounter = 0x0015F5CCu;
-constexpr openrac::gaddr kNanotechOwnerPtr = 0x0Cu;
-constexpr openrac::gaddr kNanotechBobOffset = 0x00u;
-constexpr openrac::gaddr kNanotechBobPhase = 0x04u;
-constexpr openrac::gaddr kNanotechGroundVelocity = 0x50u;
-constexpr openrac::gaddr kMobyYaw = 0x48u;
-constexpr openrac::gaddr kPairedTargetSteeringVelocity = 0x38u;
-constexpr openrac::gaddr kFleetLaserWidth = 0x4Cu;
+namespace gcw = gc_weapon_wheel;
+namespace gc = gc_weapon_wheel::gc;
+namespace rac1 = openrac::rac1;
 
-// Game-code addresses from the RAC1 PAL and NTSC-U decompilations. Both
-// callbacks are resolved for the current loaded level; nothing is patched in
-// OpenRAC itself. The electrical bolt draw function uses initialized geometry
-// but does not execute the controller's shock/timer update.
-constexpr openrac::gaddr kPalAddDrawCallback = 0x001F49B0u;
-constexpr openrac::gaddr kNtscAddDrawCallback = 0x001F4600u;
-// This native pointer type is ONLY for checking that the draw function exists.
-// The game's callback queue takes two 32-bit guest addresses, not host pointers.
-using GameDrawEffectFn = void (*)(void*);
-using GameAddDrawCallbackFn = void (*)(std::uint32_t, std::uint32_t);
-using GameBuildMobyMatrixFn = void (*)(std::uint32_t);
+openrac::Mod* g_mod = nullptr;
 
-struct FrozenAnimation {
-    int level;
-    openrac::gaddr array_base;
-    openrac::gaddr moby;
-    std::uint64_t spawn_frame;
-    std::int16_t oclass;
-};
+gc::Shim& layer() { return gc::shim(); }
 
-openrac::Mod* game_mod = nullptr;
-bool wheel_active = false;
-std::atomic<bool> wheel_visible_for_overlay{false};
-bool wheel_seen_this_tick = false;
-bool world_gate = false;
-bool blackwater_water_draw_hook = false;
-bool blackwater_water_first_draw_logged = false;
-bool blackwater_water_missing_draw_warned = false;
-pause_policy::BlackwaterWaterDrawFrameLimiter blackwater_water_draw_limiter;
-bool quartu_electric_draw_hook = false;
-bool quartu_electric_first_draw_logged = false;
-bool quartu_electric_missing_draw_warned = false;
-bool vendor_draw_hook = false;
-bool vendor_first_draw_logged = false;
-bool vendor_missing_draw_warned = false;
-bool vendor_first_original_refresh_logged = false;
-bool nanotech_draw_hook = false;
-bool nanotech_first_draw_logged = false;
-bool nanotech_missing_draw_warned = false;
-bool nanotech_missing_clocks_warned = false;
-bool nanotech_first_particle_refresh_logged = false;
-bool nanotech_first_detached_refresh_logged = false;
-bool nanotech_missing_primary_warned = false;
-bool paired_target_effect_hook = false;
-bool paired_target_first_effect_logged = false;
-bool paired_target_missing_clocks_warned = false;
-bool kalebo_wall_ribbon_hook = false;
-bool kalebo_wall_first_refresh_logged = false;
-bool fleet_laser_draw_hook = false;
-bool fleet_laser_first_draw_logged = false;
-bool fleet_laser_missing_draw_warned = false;
-bool fleet_backdrop_draw_hook = false;
-bool fleet_backdrop_first_draw_logged = false;
-bool fleet_backdrop_missing_draw_warned = false;
-bool veldin_orbit_spark_draw_hook = false;
-bool veldin_orbit_spark_first_draw_logged = false;
-bool veldin_orbit_spark_missing_draw_warned = false;
-bool veldin_orbit_airflow_draw_hook = false;
-bool veldin_orbit_airflow_first_draw_logged = false;
-bool veldin_orbit_airflow_missing_draw_warned = false;
-bool veldin_final_barrier_draw_hook = false;
-bool veldin_final_barrier_first_draw_logged = false;
-bool veldin_final_barrier_missing_draw_warned = false;
-bool veldin_final_lift_draw_hook = false;
-bool veldin_final_lift_first_draw_logged = false;
-bool veldin_final_lift_missing_draw_warned = false;
-pause_policy::VendorVisualPhaseLock vendor_phases;
-pause_policy::VendorBrightnessHold vendor_brightness;
-bool freeze_animations = true;
-bool keep_water = true;
-bool hold_hoven_scroll = true;
-bool diagnostic_log = false;
-bool soften_background = true;
-int background_softening_strength = 30;
-using GameDrawRectFn = void (*)(std::int32_t, std::int32_t, std::int32_t,
-                                std::int32_t, std::uint64_t);
-GameDrawRectFn legacy_draw_rect = nullptr;
-bool legacy_draw_rect_warning_logged = false;
-bool legacy_first_draw_logged = false;
-openrac::gaddr moby_array_global = 0;
-openrac::gaddr frame_time_global = 0;
-std::vector<FrozenAnimation> flagged_mobys;
-int observed_level = -1;
-std::set<int> observed_classes;
-std::set<int> exempted_classes;
-int vendor_visual_draw_count = 0;
-int blackwater_water_draw_count = 0;
-int vendor_original_refresh_count = 0;
-int nanotech_attached_glow_count = 0;
-int nanotech_detached_glow_count = 0;
-int nanotech_visual_draw_count = 0;
-std::array<int, static_cast<std::size_t>(pause_policy::NanotechPauseProbe::Count)>
-    nanotech_probe_counts{};
-std::uint32_t nanotech_probe_primary_slot = 0;
-std::uint32_t nanotech_probe_primary_ptr = 0;
-int nanotech_probe_primary_class = -1;
-int kalebo_wall_ribbon_refresh_count = 0;
-int fleet_laser_draw_count = 0;
-int fleet_backdrop_draw_count = 0;
-int veldin_orbit_spark_draw_count = 0;
-int veldin_orbit_airflow_draw_count = 0;
-int veldin_final_barrier_draw_count = 0;
-int veldin_final_lift_draw_count = 0;
-
-void log_class_list(const char* label, const std::set<int>& classes) {
-    std::string line = std::string("pause diagnostic ") + label + ":";
-    for (const auto oclass : classes) {
-        const auto entry = " " + std::to_string(oclass);
-        if (line.size() + entry.size() > 220) {
-            game_mod->info(line);
-            line = std::string("pause diagnostic ") + label + " (cont):";
-        }
-        line += entry;
+// "Hold before pausing": the HUD-open request's countdown, Going Commando's 4 frames or longer.
+int open_delay_frames(const std::string& choice) {
+    if (choice == "going_commando") {
+        return gc::kGcOpenDelay;
     }
-    game_mod->info(line);
+    if (choice == "longer") {
+        return gc::kOpenDelayLonger;
+    }
+    return gc::kOpenDelayLittleLonger;
 }
 
-void report_pause_diagnostics() {
-    if (diagnostic_log && observed_level >= 0) {
-        game_mod->info("pause diagnostic: level=" + std::to_string(observed_level)
-                       + ", seen=" + std::to_string(observed_classes.size())
-                       + " distinct moby classes, exempted="
-                       + std::to_string(exempted_classes.size()));
-        log_class_list("seen", observed_classes);
-        log_class_list("exempted", exempted_classes);
-        game_mod->info("pause diagnostic visual updates: vendor_draw="
-                       + std::to_string(vendor_visual_draw_count)
-                       + ", blackwater_water_draw="
-                       + std::to_string(blackwater_water_draw_count)
-                       + ", vendor_original_refresh="
-                       + std::to_string(vendor_original_refresh_count)
-                       + ", nanotech_halo=" + std::to_string(nanotech_attached_glow_count)
-                       + ", nanotech_detached_halo=" + std::to_string(nanotech_detached_glow_count)
-                       + ", nanotech_draw_only=" + std::to_string(nanotech_visual_draw_count)
-                       + ", kalebo_wall=" + std::to_string(kalebo_wall_ribbon_refresh_count)
-                       + ", fleet_laser=" + std::to_string(fleet_laser_draw_count)
-                       + ", fleet_backdrop=" + std::to_string(fleet_backdrop_draw_count)
-                       + ", orbit_spark_barrier=" + std::to_string(veldin_orbit_spark_draw_count)
-                       + ", orbit_airflow_veil=" + std::to_string(veldin_orbit_airflow_draw_count)
-                       + ", veldin_final_barrier=" + std::to_string(veldin_final_barrier_draw_count)
-                       + ", veldin_final_lift=" + std::to_string(veldin_final_lift_draw_count));
-        const auto count = [](pause_policy::NanotechPauseProbe category) {
-            return nanotech_probe_counts[static_cast<std::size_t>(category)];
-        };
-        game_mod->info("pause diagnostic nanotech probe: attached_ok="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::AttachedRefresh))
-                       + ", attached_fallback="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::AttachedFallback))
-                       + ", detached_ok="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::DetachedRefresh))
-                       + ", detached_no_slot="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::DetachedNoSlot))
-                       + ", detached_no_primary="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::DetachedNoPrimary))
-                       + ", detached_outside_array="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::DetachedOutsideArray))
-                       + ", detached_wrong_class="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::DetachedWrongClass))
-                       + ", other="
-                       + std::to_string(count(pause_policy::NanotechPauseProbe::NotDrawable)));
-        game_mod->info("pause diagnostic nanotech primary sample: slot="
-                       + std::to_string(nanotech_probe_primary_slot)
-                       + ", pointer=" + std::to_string(nanotech_probe_primary_ptr)
-                       + ", class=" + std::to_string(nanotech_probe_primary_class));
-    }
-    observed_level = -1;
-    observed_classes.clear();
-    exempted_classes.clear();
-    vendor_visual_draw_count = 0;
-    blackwater_water_draw_count = 0;
-    vendor_original_refresh_count = 0;
-    nanotech_attached_glow_count = 0;
-    nanotech_detached_glow_count = 0;
-    nanotech_visual_draw_count = 0;
-    nanotech_probe_counts.fill(0);
-    nanotech_probe_primary_slot = 0;
-    nanotech_probe_primary_ptr = 0;
-    nanotech_probe_primary_class = -1;
-    kalebo_wall_ribbon_refresh_count = 0;
-    fleet_laser_draw_count = 0;
-    fleet_backdrop_draw_count = 0;
-    veldin_orbit_spark_draw_count = 0;
-    veldin_orbit_airflow_draw_count = 0;
-    veldin_final_barrier_draw_count = 0;
-    veldin_final_lift_draw_count = 0;
+void read_settings(openrac::Mod& mod) {
+    layer().set_options(mod.setting<bool>("pause"), mod.setting<bool>("click"),
+                        open_delay_frames(mod.setting<std::string>("open_delay")));
 }
 
-// OpenRAC 1.12 does not define openrac_overlay or Mod::on_overlay. Keep the
-// standalone mod buildable with that SDK; 1.14+ adds the optional renderer.
-#if OPENRAC_MOD_API_MINOR >= 14
-// The standard mod overlay is drawn after the game's HUD. Leave an elliptical
-// opening around Quick Select so its icons stay bright; shade only the rest.
-// The renderer API exposes rectangles, not a sampled-texture blur operation.
-void draw_background_softening(void*, const openrac_overlay* overlay) {
-    if (!wheel_visible_for_overlay.load(std::memory_order_relaxed)
-        || overlay == nullptr || overlay->rect == nullptr) {
-        return;
-    }
-    pause_veil::for_each_rect(background_softening_strength,
-                             [&](float x, float y, float w, float h, std::uint32_t rgba) {
-                                 overlay->rect(overlay->context, x, y, w, h, rgba);
-                             });
-}
-#endif
+void connect() { layer().connect(g_mod->loaded_level()); }
 
-// The game's active moby array can move between levels and after a respawn.
-// Read the global through the SDK's relocation facility instead of caching
-// an address across a level load.
-openrac::gaddr current_moby_array() {
-    if (game_mod == nullptr || game_mod->loaded_level() < 0) {
-        return 0;
-    }
-    const auto location = game_mod->relocate(moby_array_global);
-    return location != 0 ? game_mod->memory().read<openrac::gaddr>(location) : 0;
+// The first time each hook point runs, in the log.
+void first(const char* hook) {
+    layer().log_once(std::string("hook ") + hook, std::string("first call of ") + hook);
 }
 
-openrac::gaddr moby_at(int slot, openrac::gaddr array_base) {
-    // The gate supplies game-owned slots, but avoid arithmetic on a bad slot.
-    if (slot < 0 || slot >= 32768 || array_base == 0) {
-        return 0;
-    }
-    return array_base + static_cast<openrac::gaddr>(slot) * kMobySize;
+template <class Fn>
+Fn optional_function(openrac::Mod& mod, const char* name) {
+    return mod.function<Fn>(name);
 }
 
-bool is_moby_in_active_array(openrac::gaddr address, openrac::gaddr array_base) {
-    return array_base != 0 && address >= array_base
-           && (address - array_base) % kMobySize == 0
-           && (address - array_base) / kMobySize < 32768;
-}
+void connect_game(openrac::Mod& mod, bool ntsc) {
+    gc::Game& g = layer().game;
+    openrac::Mod* m = &mod;
+    g.memory = gc::Memory{mod.memory().base()};
+    g.disc = gcw::disc_for(ntsc);
+    const gcw::FunctionNames n = gcw::function_names(ntsc);
 
-void stop_animation(openrac::gaddr moby, openrac::gaddr array_base, int level,
-                    std::int16_t oclass) {
-    auto memory = game_mod->memory();
-    const auto flags = memory.read<std::uint16_t>(moby + kMobyFlags);
-    if ((flags & pause_policy::kSkipAnimation) != 0) {
-        return; // The game already owned this bit: never clear it later.
+    g.relocate = [m](std::uint32_t a) { return m->relocate_level(0, a); };
+    g.relocate_exe = [m](std::uint32_t a) { return m->relocate(a); };
+    // A level's copy of a function, at its place from the decomps' catalogues (layout.hpp): taken
+    // only when the disc's function table has the function of that name there.
+    g.code_matches = [m](std::uint32_t address, const char* name) {
+        using Any = void (*)();
+        const Any at = m->function_at<Any>(address);
+        return at != nullptr && at == m->function<Any>(name);
+    };
+    using V = void (*)();
+    using VI = void (*)(int);
+    using II = int (*)(int);
+    const auto freeze_init = mod.required_function<void (*)(unsigned int, int, int)>(n.mode_freeze_init);
+    g.mode_freeze_init = [freeze_init](int kind, int a, int b) { freeze_init(static_cast<unsigned int>(kind), a, b); };
+    g.update_hud_elements = mod.required_function<II>(n.update_hud_elements);
+    if (const auto help = optional_function<V>(mod, n.help_update)) {
+        g.help_update = help;
     }
+    g.music_unpause = mod.required_function<V>(n.music_unpause);
+    g.music_pause = mod.required_function<VI>(n.music_pause);
+    g.snd_pause_group = mod.required_function<VI>(n.snd_pause_group);
+    g.snd_continue_group = mod.required_function<VI>(n.snd_continue_group);
+    const auto flush = mod.required_function<int (*)()>(n.snd_flush);
+    g.snd_flush = [flush] { flush(); };
+    g.draw_hud_sprite = mod.required_function<void (*)(int, int, int, int, int, int)>(n.draw_hud_sprite);
+    g.get_icon_frame = mod.required_function<int (*)(int, int)>(n.get_icon_frame);
+    const auto frame = mod.required_function<void (*)(std::uint32_t, int, int, int, unsigned int, int)>(n.hud_frame);
+    g.hud_frame = [frame](std::uint32_t rec, int f, int x, int y, std::uint32_t scale, int alpha) {
+        frame(rec, f, x, y, scale, alpha);
+    };
+    // FontPrintCenter takes the text's game address: the text goes on the game's stack for the call.
+    const auto print = mod.required_function<int (*)(int, int, unsigned long long, int, int)>(n.font_print_center);
+    g.font_print_center = [m, print](int x, int y, std::uint32_t colour, const char* text, int length) {
+        const std::size_t size = std::strlen(text) + 1;
+        const openrac::StackFrame frame(*m, static_cast<std::uint32_t>(size));
+        std::memcpy(m->memory().pointer(frame.address()), text, size);
+        print(x, y, colour, static_cast<int>(frame.address()), length);
+    };
+    const auto msg = mod.required_function<int (*)(int)>(n.msg_string);
+    g.msg_string = [msg](int id) { return static_cast<std::uint32_t>(msg(id)); };
+    const auto tween = mod.required_function<unsigned long long (*)(unsigned int, unsigned int, float)>(n.fast_tween_color);
+    g.fast_tween_color = [tween](std::uint32_t a, std::uint32_t b, float t) { return static_cast<std::uint32_t>(tween(a, b, t)); };
+    // hud_screen_position writes through pointers to its x and y: they go on the game's stack.
+    const auto position = mod.required_function<int (*)(std::uint32_t, std::uint32_t, std::uint32_t)>(n.hud_screen_position);
+    g.hud_screen_position = [m, position](std::uint32_t rec, int& x, int& y) {
+        const openrac::StackFrame frame(*m, 8);
+        const openrac::Memory memory = m->memory();
+        memory.write<std::int32_t>(frame.address(), x);
+        memory.write<std::int32_t>(frame.address() + 4, y);
+        position(rec, frame.address(), frame.address() + 4);
+        x = memory.read<std::int32_t>(frame.address());
+        y = memory.read<std::int32_t>(frame.address() + 4);
+    };
+    g.show_health_hud = mod.required_function<int (*)()>(n.show_health_hud);
+    g.hud_keep_visible = mod.required_function<int (*)(int, int)>(n.hud_keep_visible);
+    const auto queue = mod.required_function<int (*)(int, int, int, int, int, int, int)>(n.queue_animation_update);
+    g.queue_animation_update = [queue](int key, int a, std::uint32_t init, std::uint32_t update, std::uint32_t draw,
+                                       std::uint32_t data, int b) {
+        return queue(key, a, static_cast<int>(init), static_cast<int>(update), static_cast<int>(draw),
+                     static_cast<int>(data), b);
+    };
+    g.remove_hud_item = mod.required_function<II>(n.remove_hud_item);
+    g.append_gif_transfer_packet = mod.required_function<V>(n.append_gif_transfer_packet);
+    g.draw_debug_profiler = mod.required_function<V>(n.draw_debug_profiler);
+    const auto bank = mod.required_function<int (*)(int, int, int)>(n.play_bank_sound);
+    g.play_click = [bank] { bank(0, 1, 0); };
 
-    flagged_mobys.push_back(FrozenAnimation{
-        level, array_base, moby,
-        memory.read<std::uint64_t>(moby + kMobySpawnFrame), oclass
-    });
-    memory.write<std::uint16_t>(moby + kMobyFlags,
-                                pause_policy::with_animation_stopped(flags));
-}
+    // The math: Ratchet & Clank's own where its build has them by these names.
+    if (const auto f = optional_function<float (*)(float)>(mod, n.square_root)) g.square_root = f;
+    if (const auto f = optional_function<float (*)(float, float)>(mod, n.fast_arc_tan)) g.fast_arc_tan = f;
+    if (const auto f = optional_function<float (*)(float, float)>(mod, n.diff_rots)) g.diff_rots = f;
+    if (const auto f = optional_function<float (*)(float, float)>(mod, n.sub_rots)) g.sub_rots = f;
+    if (const auto f = optional_function<float (*)(float)>(mod, n.normalize_angle)) g.normalize_angle = f;
+    if (const auto f = optional_function<float (*)(float, float)>(mod, n.add_rots)) g.add_rots = f;
+    if (const auto f = optional_function<float (*)(float)>(mod, n.sin)) g.sin = f;
+    if (const auto f = optional_function<float (*)(float)>(mod, n.cos)) g.cos = f;
+    if (const auto f = optional_function<float (*)(int)>(mod, n.int_to_float)) g.int_to_float = f;
+    if (const auto f = optional_function<int (*)(float)>(mod, n.float_to_int)) g.float_to_int = f;
 
-void restore_animations() {
-    if (game_mod == nullptr || flagged_mobys.empty()) {
-        return;
-    }
-
-    const int level = game_mod->loaded_level();
-    const auto array_base = current_moby_array();
-    auto memory = game_mod->memory();
-    for (const auto& saved : flagged_mobys) {
-        // Never alter a different level's moby or a new occupant of the slot.
-        if (level != saved.level || array_base != saved.array_base
-            || memory.read<std::uint64_t>(saved.moby + kMobySpawnFrame) != saved.spawn_frame
-            || memory.read<std::int16_t>(saved.moby + kMobyClass) != saved.oclass) {
-            continue;
-        }
-        const auto flags = memory.read<std::uint16_t>(saved.moby + kMobyFlags);
-        memory.write<std::uint16_t>(saved.moby + kMobyFlags,
-                                    pause_policy::with_animation_resumed(flags));
-    }
-    flagged_mobys.clear();
-}
-
-int gate_moby_update(void*, int slot, int phase) {
-    if (phase != OPENRAC_MOBY_BEFORE || !wheel_active) {
-        return 0;
-    }
-
-    const auto array_base = current_moby_array();
-    const auto moby = moby_at(slot, array_base);
-    if (moby == 0) {
-        // The original mod skipped updates even when the game exposes no array.
-        return 1;
-    }
-
-    const auto oclass = game_mod->memory().read<std::int16_t>(moby + kMobyClass);
-    const int level = game_mod->loaded_level();
-    if (diagnostic_log) {
-        if (observed_level != level) {
-            observed_classes.clear();
-            exempted_classes.clear();
-            observed_level = level;
-        }
-        observed_classes.insert(oclass);
-    }
-    const auto state = oclass == 803 || oclass == 552
-        ? game_mod->memory().read<std::uint8_t>(moby + kMobyState) : 0u;
-    const auto flags = oclass == 552
-        ? game_mod->memory().read<std::uint16_t>(moby + kMobyFlags) : 0u;
-    const bool nanotech_draw_only = pause_policy::should_route_nanotech_draw(
-        wheel_active, keep_water, world_gate, nanotech_draw_hook, oclass);
-    const bool paired_target_effects = pause_policy::should_route_paired_swingshot_glow(
-        wheel_active, keep_water, world_gate, paired_target_effect_hook, oclass, state);
-    const bool vendor_draw_only = pause_policy::should_route_vendor_draw(
-        wheel_active, keep_water, world_gate, vendor_draw_hook, oclass);
-    const bool blackwater_water_draw_only = pause_policy::should_route_blackwater_water_draw(
-        wheel_active, keep_water, world_gate, blackwater_water_draw_hook, level, oclass);
-    const bool kalebo_wall_ribbons = pause_policy::should_route_kalebo_wall_ribbons(
-        wheel_active, keep_water, world_gate, kalebo_wall_ribbon_hook,
-        level, oclass, state, flags);
-    const bool fleet_laser_draw_only = pause_policy::should_route_fleet_laser_draw(
-        wheel_active, keep_water, world_gate, fleet_laser_draw_hook, level, oclass);
-    const bool fleet_backdrop_draw_only = pause_policy::should_route_fleet_backdrop_draw(
-        wheel_active, keep_water, world_gate, fleet_backdrop_draw_hook, level, oclass);
-    const bool veldin_orbit_doorway_draw_only = pause_policy::should_route_veldin_orbit_doorway_draw(
-        wheel_active, keep_water, world_gate,
-        oclass == 78 ? veldin_orbit_spark_draw_hook : veldin_orbit_airflow_draw_hook,
-        level, oclass);
-    const bool veldin_final_barrier_draw_only = pause_policy::should_route_veldin_final_barrier_draw(
-        wheel_active, keep_water, world_gate, veldin_final_barrier_draw_hook, level, oclass);
-    const bool veldin_final_lift_draw_only = pause_policy::should_route_veldin_final_lift_draw(
-        wheel_active, keep_water, world_gate, veldin_final_lift_draw_hook, level, oclass);
-    if (keep_water && (pause_policy::needs_update_for_water(level, oclass)
-                       || vendor_draw_only || blackwater_water_draw_only
-                       || nanotech_draw_only || paired_target_effects
-                       || kalebo_wall_ribbons || fleet_laser_draw_only
-                       || fleet_backdrop_draw_only || veldin_orbit_doorway_draw_only
-                       || veldin_final_barrier_draw_only
-                       || veldin_final_lift_draw_only
-                       || pause_policy::should_route_quartu_electric_draw(
-                           wheel_active, keep_water, world_gate,
-                           quartu_electric_draw_hook, level, oclass))) {
-        if (diagnostic_log) {
-            exempted_classes.insert(oclass);
-        }
-        // Class 655 and the class-806 health orb use draw-only hooks.
-        // Class 803 instead runs just enough of its effect update to emit
-        // the yellow link particles with its motion clocks stopped.
-        if (vendor_draw_only || nanotech_draw_only || paired_target_effects
-            || kalebo_wall_ribbons || fleet_laser_draw_only || fleet_backdrop_draw_only
-            || veldin_orbit_doorway_draw_only || veldin_final_barrier_draw_only
-            || veldin_final_lift_draw_only) {
-            // The visible moby animation can advance earlier in the game
-            // loop. Always hold it even if general animation freeze is off.
-            stop_animation(moby, array_base, level, oclass);
-        }
-        return 0;
-    }
-
-    if (freeze_animations) {
-        stop_animation(moby, array_base, level, oclass);
-    }
-    return 1; // Skip its gameplay update, as in the original mod.
-}
-
-// Level 17 has two visually similar but independent doorway effects. Class 78
-// draws the yellow spark field and class 1378 draws the layered air-flow veil.
-// Their full updates spawn particles or modify the hero's updraft state, so
-// register only the original textured-quad callbacks while Quick Select is up.
-template <typename Original>
-void refresh_veldin_orbit_doorway(Original original, std::uint32_t moby) {
-    if (!wheel_active || !world_gate) {
-        original(moby);
-        return;
-    }
-    if (moby == 0) {
-        return;
-    }
-
-    const auto memory = game_mod->memory();
-    const int oclass = memory.read<std::int16_t>(moby + kMobyClass);
-    const bool hook_installed = oclass == 78 ? veldin_orbit_spark_draw_hook
-                                                     : veldin_orbit_airflow_draw_hook;
-    if (!pause_policy::should_route_veldin_orbit_doorway_draw(
-            wheel_active, keep_water, world_gate, hook_installed,
-            game_mod->loaded_level(), oclass)) {
-        return;
-    }
-    const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-    const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-    if (!pause_policy::can_draw_veldin_orbit_doorway(oclass, state, pvars)) {
-        return;
-    }
-
-    const bool pal = game_mod->version() == "pal";
-    const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-        pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-    const auto draw = game_mod->function_at<GameDrawEffectFn>(
-        pause_policy::veldin_orbit_doorway_draw_code_address(pal, oclass));
-    bool& missing_logged = oclass == 78 ? veldin_orbit_spark_missing_draw_warned
-                                         : veldin_orbit_airflow_missing_draw_warned;
-    if (add == nullptr || draw == nullptr) {
-        if (!missing_logged) {
-            game_mod->warn(oclass == 78
-                ? "Veldin Orbit spark-field draw callback unavailable; original update stays paused"
-                : "Veldin Orbit air-flow draw callback unavailable; updraft stays paused");
-            missing_logged = true;
-        }
-        return;
-    }
-
-    pause_policy::enqueue_veldin_orbit_doorway(pal, oclass, moby, add);
-    int& count = oclass == 78 ? veldin_orbit_spark_draw_count
-                             : veldin_orbit_airflow_draw_count;
-    ++count;
-    bool& first_logged = oclass == 78 ? veldin_orbit_spark_first_draw_logged
-                                      : veldin_orbit_airflow_first_draw_logged;
-    if (!first_logged) {
-        game_mod->info(oclass == 78
-            ? "Veldin Orbit doorway spark-field quads drawn while emitter gameplay remains paused"
-            : "Veldin Orbit exterior air-flow veil drawn while hero updraft remains paused");
-        first_logged = true;
-    }
+    g.log = [m](const char* what) { m->warn(std::string("Weapon Wheel Pause: ") + what); };
+    g.info = [m](const char* what) { m->info(std::string("Weapon Wheel Pause: ") + what); };
 }
 
 void load(openrac::Mod& mod) {
     if (mod.game() != "rac1") {
-        throw openrac::Error("Weapon Wheel Pause is for Ratchet & Clank 1");
+        throw openrac::Error("this mod is for Ratchet & Clank");
     }
-    if (mod.version() != "pal" && mod.version() != "ntsc") {
-        throw openrac::Error("Only RAC1 PAL and NTSC-U are supported");
+    const bool ntsc = mod.version() == "ntsc";
+    if (!ntsc && mod.version() != "pal") {
+        throw openrac::Error("this mod knows the PAL and NTSC-U discs only");
     }
+    g_mod = &mod;
+    connect_game(mod, ntsc);
+    read_settings(mod);
 
-    game_mod = &mod;
-    wheel_active = false;
-    wheel_visible_for_overlay.store(false, std::memory_order_relaxed);
-    legacy_draw_rect = nullptr;
-    legacy_draw_rect_warning_logged = false;
-    legacy_first_draw_logged = false;
-    wheel_seen_this_tick = false;
-    world_gate = false;
-    blackwater_water_draw_hook = false;
-    blackwater_water_first_draw_logged = false;
-    blackwater_water_missing_draw_warned = false;
-    blackwater_water_draw_limiter.reset();
-    blackwater_water_draw_count = 0;
-    quartu_electric_draw_hook = false;
-    quartu_electric_first_draw_logged = false;
-    quartu_electric_missing_draw_warned = false;
-    vendor_draw_hook = false;
-    vendor_first_draw_logged = false;
-    vendor_missing_draw_warned = false;
-    vendor_first_original_refresh_logged = false;
-    nanotech_draw_hook = false;
-    nanotech_first_draw_logged = false;
-    nanotech_missing_draw_warned = false;
-    nanotech_missing_clocks_warned = false;
-    nanotech_first_particle_refresh_logged = false;
-    nanotech_first_detached_refresh_logged = false;
-    nanotech_missing_primary_warned = false;
-    nanotech_probe_counts.fill(0);
-    nanotech_probe_primary_slot = 0;
-    nanotech_probe_primary_ptr = 0;
-    nanotech_probe_primary_class = -1;
-    paired_target_effect_hook = false;
-    paired_target_first_effect_logged = false;
-    paired_target_missing_clocks_warned = false;
-    kalebo_wall_ribbon_hook = false;
-    kalebo_wall_first_refresh_logged = false;
-    fleet_laser_draw_hook = false;
-    fleet_laser_first_draw_logged = false;
-    fleet_laser_missing_draw_warned = false;
-    fleet_backdrop_draw_hook = false;
-    fleet_backdrop_first_draw_logged = false;
-    fleet_backdrop_missing_draw_warned = false;
-    veldin_orbit_spark_draw_hook = false;
-    veldin_orbit_spark_first_draw_logged = false;
-    veldin_orbit_spark_missing_draw_warned = false;
-    veldin_orbit_airflow_draw_hook = false;
-    veldin_orbit_airflow_first_draw_logged = false;
-    veldin_orbit_airflow_missing_draw_warned = false;
-    veldin_final_barrier_draw_hook = false;
-    veldin_final_barrier_first_draw_logged = false;
-    veldin_final_barrier_missing_draw_warned = false;
-    veldin_final_lift_draw_hook = false;
-    veldin_final_lift_first_draw_logged = false;
-    veldin_final_lift_missing_draw_warned = false;
-    vendor_phases.reset();
-    vendor_brightness.reset();
-    flagged_mobys.clear();
-    observed_level = -1;
-    observed_classes.clear();
-    exempted_classes.clear();
-    freeze_animations = mod.setting<bool>("freeze_animations");
-    keep_water = mod.setting<bool>("keep_water");
-    hold_hoven_scroll = mod.setting<bool>("hold_hoven_scroll");
-    diagnostic_log = mod.setting<bool>("diagnostic_log");
-    soften_background = mod.setting<bool>("soften_background");
-    background_softening_strength = mod.setting<int>("background_softening_strength");
-    moby_array_global = mod.version() == "pal" ? kPalMobyArrayGlobal : kNtscMobyArrayGlobal;
-    frame_time_global = mod.version() == "pal" ? kPalFrameTimeGlobal : kNtscFrameTimeGlobal;
-
-    mod.hook<openrac::rac1::Hud_QuickSelect_Update>([](auto original, std::uint32_t selector) {
-        wheel_active = true;
-        wheel_visible_for_overlay.store(true, std::memory_order_relaxed);
-        wheel_seen_this_tick = true;
-        original(selector); // Keep the real weapon wheel responsive.
+    mod.hook<rac1::Level_UpdatePlay>([](auto original) {
+        connect();
+        first("rac1.level.update_play");
+        layer().update_play([&] { original(); });
+    });
+    mod.hook<rac1::Freeze_Update>([](auto original) {
+        connect();
+        first("rac1.freeze.update");
+        layer().freeze_update([&] { original(); });
+    });
+    mod.hook<rac1::Freeze_Draw>([](auto original) {
+        connect();
+        first("rac1.freeze.draw");
+        layer().freeze_draw([&] { original(); });
+    });
+    mod.hook<rac1::Hud_QuickSelect_Init>([](auto, std::uint32_t record) {
+        connect();
+        first("rac1.hud.quick_select.init");
+        layer().selector_init(record);
+    });
+    mod.hook<rac1::Hud_QuickSelect_Update>([](auto, std::uint32_t record) {
+        connect();
+        first("rac1.hud.quick_select.update");
+        layer().selector_update(record);
+    });
+    mod.hook<rac1::Hud_QuickSelect_Draw>([](auto, std::uint32_t record) -> std::int32_t {
+        connect();
+        first("rac1.hud.quick_select.draw");
+        return layer().selector_draw(record);
     });
 
-    mod.hook<openrac::rac1::Hero_Update>([](auto original) {
-        if (!wheel_active) {
-            original();
-        }
-    });
-
-    // Blackwater class 831 owns the moving flood as well as all 48 water
-    // grids. Its ordinary update would continue the flooding room's timer,
-    // and pool_flush advances ripple buffers. While Quick Select is open,
-    // enqueue just the already-prepared water-grid renderer from record 0.
-    // Do not run original(), pool_flush(), or enqueue once per water record.
-    try {
-        mod.hook<openrac::rac1::Moby_Water_Update>([](auto original, std::uint32_t moby) {
-            const bool draw_only = pause_policy::should_route_blackwater_water_draw(
-                wheel_active, keep_water, world_gate,
-                blackwater_water_draw_hook, game_mod->loaded_level(), 831);
-            bool enqueue_draw = false;
-            GameAddDrawCallbackFn add_callback = nullptr;
-            const bool pal = game_mod->version() == "pal";
-            if (draw_only && moby != 0) {
-                const auto memory = game_mod->memory();
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                if (state != 0 && pvars != 0) {
-                    const auto record_index = memory.read<std::int32_t>(
-                        pvars + kBlackwaterWaterRecordIndex);
-                    if (pause_policy::can_draw_blackwater_water_grid(state, pvars, record_index)
-                        && !blackwater_water_draw_limiter.queued_this_frame) {
-                        add_callback = game_mod->function_at<GameAddDrawCallbackFn>(
-                            pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                        const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                            pause_policy::blackwater_water_draw_code_address(pal));
-                        if (add_callback == nullptr || draw == nullptr) {
-                            if (!blackwater_water_missing_draw_warned) {
-                                game_mod->warn("Blackwater water-grid renderer unavailable; flood remains paused");
-                                blackwater_water_missing_draw_warned = true;
-                            }
-                        } else {
-                            enqueue_draw = blackwater_water_draw_limiter.claim(true, true);
-                        }
-                    }
-                }
-            }
-
-            pause_policy::dispatch_blackwater_water_update(
-                draw_only, enqueue_draw,
-                [&] { original(moby); },
-                [&] {
-                    pause_policy::enqueue_blackwater_water_grid(pal, moby, add_callback);
-                    ++blackwater_water_draw_count;
-                    if (!blackwater_water_first_draw_logged) {
-                        game_mod->info("Blackwater water grids drawn from preserved state while flood logic stays paused");
-                        blackwater_water_first_draw_logged = true;
-                    }
-                });
-        });
-        blackwater_water_draw_hook = true;
-        mod.info("Blackwater water-grid draw-only hook registered (class 831)");
-    } catch (const openrac::Error&) {
-        mod.warn("Blackwater water-grid draw hook unavailable; flood stays paused and surface may be hidden");
+    if (mod.has_settings_set()) {
+        mod.on_settings([] { read_settings(*g_mod); });
     }
-
-    // Class 1901 draws Hoven's scrolling layered surface. Skipping its update
-    // removes the surface, but running it normally advances the UV phases.
-    // Its own update uses frame_delta_time for phase changes and then queues
-    // its draw callback, so stop the clock only during this one function call.
-    try {
-        mod.hook<openrac::rac1::Moby_Class1901_Update>([](auto original, std::uint32_t moby) {
-            if (!pause_policy::should_hold_hoven_scroll(
-                    wheel_active, game_mod->loaded_level(), keep_water, hold_hoven_scroll)) {
-                original(moby);
-                return;
-            }
-
-            const auto address = game_mod->relocate(frame_time_global);
-            if (address == 0) {
-                original(moby); // Fall back to drawing normally if relocation failed.
-                return;
-            }
-            auto memory = game_mod->memory();
-            pause_policy::with_stopped_frame_time(
-                [&] { return memory.read<float>(address); },
-                [&](float value) { memory.write<float>(address, value); },
-                [&] { original(moby); });
-        });
-        mod.info("Hoven scroll-hold hook registered (class 1901)");
-    } catch (const openrac::Error&) {
-        mod.warn("Hoven scroll-hold hook unavailable; water will still scroll");
-    }
-
-    // Quartu class 655 draws lightning, but its ordinary update also changes
-    // shock timers, triggers audio, and damages Ratchet. Intercept the update
-    // during Quick Select and only enqueue the game's already-initialized
-    // bolt draw callback. Do not invoke original() while the world is paused.
-    try {
-        mod.hook<openrac::rac1::Moby_Class655_Update>(
-            [](auto original, std::uint32_t moby) {
-                const bool draw_only = pause_policy::should_route_quartu_electric_draw(
-                    wheel_active, keep_water, world_gate,
-                    quartu_electric_draw_hook, game_mod->loaded_level(), 655);
-                bool drawable = false;
-                if (draw_only && moby != 0) {
-                    auto memory = game_mod->memory();
-                    const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                    const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                    const auto light_slot = pvars == 0 ? -1
-                        : memory.read<std::int32_t>(pvars + kQuartuElectricLightSlot);
-                    drawable = pause_policy::can_draw_quartu_electric_arc(
-                        state, pvars, light_slot);
-                }
-
-                pause_policy::dispatch_quartu_electric_update(
-                    draw_only, drawable,
-                    [&] { original(moby); },
-                    [&] {
-                        const bool pal = game_mod->version() == "pal";
-                        const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                            pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                        const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                            pause_policy::quartu_electric_bolt_code_address(pal));
-                        if (add == nullptr || draw == nullptr) {
-                            if (!quartu_electric_missing_draw_warned) {
-                                game_mod->warn("Quartu electric bolt draw function unavailable; shock update remains frozen");
-                                quartu_electric_missing_draw_warned = true;
-                            }
-                            return;
-                        }
-                        // The game stores code addresses in its callback list.
-                        // Passing `draw` (a native pointer) truncates it into
-                        // an invalid guest target and causes a port call error.
-                        pause_policy::enqueue_quartu_electric_bolt(pal, moby, add);
-                        if (!quartu_electric_first_draw_logged) {
-                            game_mod->info("Quartu electric bolt visual-only draw enqueued while gameplay is paused");
-                            quartu_electric_first_draw_logged = true;
-                        }
-                    });
-            });
-        quartu_electric_draw_hook = true;
-        mod.info("Quartu electric bolt draw-only hook registered (class 655)");
-    } catch (const openrac::Error&) {
-        mod.warn("Quartu class 655 hook unavailable; electric bolts remain paused");
-    }
-
-    // Class 11's visual update not only queues the beam: it also refreshes
-    // the vendor ring's cached matrices. Hand-queuing its draw did not keep
-    // the beam visible in-game. Reuse the original state-1 visual setup,
-    // forcing a non-proximity frame tick so it cannot enter state 2 or the
-    // shop menu. Restore the real state, frame counter, ring rotations and
-    // sphere scale immediately, and keep its glow at full strength until Quick Select
-    // closes. Class 1143's separate orb motion remains paused by the gate.
-    try {
-        mod.hook<openrac::rac1::Moby_Vendor_Update>(
-            [](auto original, std::uint32_t moby) {
-                const bool draw_only = pause_policy::should_route_vendor_draw(
-                    wheel_active, keep_water, world_gate, vendor_draw_hook, 11);
-                bool drawable = false;
-                std::uint32_t pvars = 0;
-                std::uint32_t ring = 0;
-                if (draw_only && moby != 0) {
-                    auto memory = game_mod->memory();
-                    const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                    pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                    ring = pvars == 0 ? 0u
-                        : memory.read<std::uint32_t>(pvars + kVendorRingPtr);
-                    const auto array_base = current_moby_array();
-                    drawable = pause_policy::can_draw_vendor_effects(state, pvars, ring)
-                        && is_moby_in_active_array(moby, array_base)
-                        && is_moby_in_active_array(ring, array_base)
-                        && memory.read<std::int16_t>(ring + kMobyClass) == 1143;
-                }
-
-                pause_policy::dispatch_vendor_update(
-                    draw_only, drawable,
-                    [&] { original(moby); },
-                    [&] {
-                        const bool pal = game_mod->version() == "pal";
-                        const auto phase_addresses = pause_policy::vendor_phase_addresses(pal);
-                        const auto sparkle_address = game_mod->relocate(phase_addresses.sparkle_uv);
-                        const auto glow_address = game_mod->relocate(phase_addresses.glow);
-                        if (sparkle_address == 0 || glow_address == 0) {
-                            if (!vendor_missing_draw_warned) {
-                                game_mod->warn("Gadgetron glow globals unavailable; gameplay stays paused");
-                                vendor_missing_draw_warned = true;
-                            }
-                            return;
-                        }
-
-                        auto memory = game_mod->memory();
-                        vendor_phases.capture(
-                            game_mod->loaded_level(),
-                            memory.read<float>(sparkle_address),
-                            memory.read<float>(glow_address));
-                        vendor_brightness.capture(
-                            game_mod->loaded_level(), current_moby_array(), moby,
-                            memory.read<std::uint64_t>(moby + kMobySpawnFrame),
-                            pvars, memory.read<float>(pvars + kVendorGlowStrength));
-                        memory.write<float>(glow_address,
-                            pause_policy::vendor_full_glow_alpha_phase());
-
-                        const auto counter_address = game_mod->relocate(
-                            pal ? kPalLevelFrameCounter : kNtscLevelFrameCounter);
-                        const auto rebuild_address =
-                            pause_policy::vendor_matrix_rebuild_code_address(
-                                pal, game_mod->loaded_level());
-                        const auto rebuild = rebuild_address == 0 ? nullptr
-                            : game_mod->function_at<GameBuildMobyMatrixFn>(rebuild_address);
-                        if (counter_address != 0 && rebuild != nullptr) {
-                            // The original state-1 path queues the real draw
-                            // and refreshes its matrix. Its state-2 shop
-                            // interaction path is never executed here.
-                            pause_policy::with_vendor_visual_state(
-                                [&] { return memory.read<std::uint8_t>(moby + kMobyState); },
-                                [&](std::uint8_t v) {
-                                    memory.write<std::uint8_t>(moby + kMobyState, v);
-                                },
-                                [&] { return memory.read<std::uint32_t>(counter_address); },
-                                [&](std::uint32_t v) {
-                                    memory.write<std::uint32_t>(counter_address, v);
-                                },
-                                [&](float v) {
-                                    memory.write<float>(pvars + kVendorGlowStrength, v);
-                                },
-                                [&] {
-                                    pause_policy::with_vendor_ring_pose_held(
-                                        [&](int i) {
-                                            const auto offset = i < 4
-                                                ? kVendorRingAQuaternion + static_cast<std::uint32_t>(i) * 4u
-                                                : kVendorRingBQuaternion
-                                                    + static_cast<std::uint32_t>(i - 4) * 4u;
-                                            return memory.read<float>(pvars + offset);
-                                        },
-                                        [&](int i, float v) {
-                                            const auto offset = i < 4
-                                                ? kVendorRingAQuaternion + static_cast<std::uint32_t>(i) * 4u
-                                                : kVendorRingBQuaternion
-                                                    + static_cast<std::uint32_t>(i - 4) * 4u;
-                                            memory.write<float>(pvars + offset, v);
-                                        },
-                                        [&] { return memory.read<float>(ring + kMobyScale); },
-                                        [&](float v) {
-                                            memory.write<float>(ring + kMobyScale, v);
-                                        },
-                                        [&] { original(moby); },
-                                        [&] { rebuild(ring); });
-                                });
-                            ++vendor_original_refresh_count;
-                            if (!vendor_first_original_refresh_logged) {
-                                game_mod->info("Gadgetron original beam refreshed with shop input/state blocked and ring pose held");
-                                vendor_first_original_refresh_logged = true;
-                            }
-                            return;
-                        }
-
-                        // Older ports may not expose the matrix builder.
-                        // Keep gameplay paused rather than run the original
-                        // update without its motion-restoration guard.
-                        const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                            pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                        const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                            pause_policy::vendor_effect_code_address(pal));
-                        if (add == nullptr || draw == nullptr) {
-                            if (!vendor_missing_draw_warned) {
-                                game_mod->warn("Gadgetron matrix rebuild unavailable; fallback draw unavailable too");
-                                vendor_missing_draw_warned = true;
-                            }
-                            return;
-                        }
-                        memory.write<float>(pvars + kVendorGlowStrength, 1.0f);
-                        pause_policy::enqueue_vendor_effects(pal, moby, add);
-                        ++vendor_visual_draw_count;
-                        if (!vendor_first_draw_logged) {
-                            game_mod->warn("Gadgetron using manual draw fallback; visual refresh unavailable on this port");
-                            vendor_first_draw_logged = true;
-                        }
-                    });
-            });
-        vendor_draw_hook = true;
-        mod.info("Gadgetron guarded original-visual hook registered (class 11)");
-    } catch (const openrac::Error&) {
-        mod.warn("Gadgetron class 11 hook unavailable; vendor visuals remain paused");
-    }
-
-    // Nanotech boxes (501) create a class-806 orb. Draw-only rendering omits
-    // the particles that form its bright purple halo. While still attached
-    // to a live crate (state 1), its original update cannot collect health;
-    // run that update with motion clocks and bobbing frozen to renew the
-    // halo. State 2 needs the same particle update, but it can also move
-    // the orb and collect health. Mask the game's primary Nanotech pointer
-    // only for that scoped visual refresh (disabling the collection branch),
-    // and restore all position/physics values immediately afterward.
-    try {
-        mod.hook<openrac::rac1::Moby_NanotechBall_Update>(
-            [](auto original, std::uint32_t moby) {
-                const bool draw_only = pause_policy::should_route_nanotech_draw(
-                    wheel_active, keep_water, world_gate, nanotech_draw_hook, 806);
-                bool drawable = false;
-                bool emit_attached = false;
-                bool emit_detached = false;
-                std::uint32_t pvars = 0;
-                std::uint32_t primary_addr = 0;
-                if (draw_only && moby != 0) {
-                    auto memory = game_mod->memory();
-                    const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                    pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                    const auto owner = pvars == 0 ? 0u
-                        : memory.read<std::uint32_t>(pvars + kNanotechOwnerPtr);
-                    const auto array_base = current_moby_array();
-                    int owner_class = -1;
-                    if (is_moby_in_active_array(owner, array_base)) {
-                        owner_class = memory.read<std::int16_t>(owner + kMobyClass);
-                        emit_attached = pause_policy::can_emit_attached_nanotech_glow(
-                            state, pvars, owner, owner_class,
-                            memory.read<std::uint8_t>(owner + kMobyState));
-                    }
-                    drawable = pause_policy::can_draw_nanotech_orb(
-                        state, pvars, owner, owner_class);
-                    std::uint32_t primary = 0;
-                    int primary_class = -1;
-                    bool primary_active = false;
-                    if (state == 2 && drawable) {
-                        primary_addr = game_mod->relocate(
-                            pause_policy::nanotech_primary_moby_global(
-                                game_mod->version() == "pal"));
-                        if (primary_addr != 0) {
-                            primary = memory.read<std::uint32_t>(primary_addr);
-                            primary_active = is_moby_in_active_array(primary, array_base);
-                            primary_class = primary_active
-                                ? memory.read<std::int16_t>(primary + kMobyClass) : -1;
-                            emit_detached = pause_policy::can_emit_detached_nanotech_glow(
-                                state, pvars, primary, primary_class);
-                        }
-                        if (!emit_detached && !nanotech_missing_primary_warned) {
-                            game_mod->warn("Detached Nanotech primary pointer unavailable; using safe orb draw-only fallback");
-                            nanotech_missing_primary_warned = true;
-                        }
-                    }
-                    if (diagnostic_log) {
-                        const auto probe = pause_policy::nanotech_pause_probe(
-                            drawable, state, emit_attached, primary_addr, primary,
-                            primary_active, primary_class);
-                        ++nanotech_probe_counts[static_cast<std::size_t>(probe)];
-                        if (state == 2 && drawable) {
-                            nanotech_probe_primary_slot = primary_addr;
-                            nanotech_probe_primary_ptr = primary;
-                            nanotech_probe_primary_class = primary_class;
-                        }
-                    }
-                }
-
-                const auto clocks = pause_policy::paired_swingshot_motion_clock_addresses(
-                    game_mod->version() == "pal");
-                const auto time_addr = (emit_attached || emit_detached)
-                    ? game_mod->relocate(clocks.frame_time) : 0u;
-                const auto sq_addr = (emit_attached || emit_detached)
-                    ? game_mod->relocate(clocks.frame_time_squared) : 0u;
-                if ((emit_attached || emit_detached) && (time_addr == 0 || sq_addr == 0)) {
-                    emit_attached = false;
-                    emit_detached = false;
-                    if (!nanotech_missing_clocks_warned) {
-                        game_mod->warn("Nanotech particle clocks unavailable; drawing orb without refreshing its halo");
-                        nanotech_missing_clocks_warned = true;
-                    }
-                }
-
-                pause_policy::dispatch_nanotech_visual_update(
-                    draw_only, drawable, emit_attached || emit_detached,
-                    [&] { original(moby); },
-                    [&] {
-                        const bool pal = game_mod->version() == "pal";
-                        const int level = game_mod->loaded_level();
-                        const auto draw_address =
-                            pause_policy::nanotech_orb_code_address(pal, level);
-                        if (draw_address == 0) {
-                            return;
-                        }
-                        const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                            pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                        const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                            draw_address);
-                        if (add == nullptr || draw == nullptr) {
-                            if (!nanotech_missing_draw_warned) {
-                                game_mod->warn("Nanotech glow draw unavailable; health pickup remains paused");
-                                nanotech_missing_draw_warned = true;
-                            }
-                            return;
-                        }
-                        pause_policy::enqueue_nanotech_orb(pal, level, moby, add);
-                        ++nanotech_visual_draw_count;
-                        if (!nanotech_first_draw_logged) {
-                            game_mod->info("Nanotech orb visual-only draw enqueued during Quick Select");
-                            nanotech_first_draw_logged = true;
-                        }
-                    },
-                    [&] {
-                        auto memory = game_mod->memory();
-                        if (emit_detached) {
-                            // The retail state-2 update emits the missing
-                            // particles, but its pickup branch requires a
-                            // non-null primary Nanotech orb. Keep that guest
-                            // pointer zero only while calling original(),
-                            // restore the orb's own pose, grounding data and
-                            // bobbing, and prevent frame-based movement.
-                            const std::array<std::uint32_t, 18> held = {
-                                primary_addr,
-                                moby + 0x10u, moby + 0x14u, moby + 0x18u, moby + 0x1Cu,
-                                moby + kMobyState, moby + 0xBCu,
-                                pvars + 0x00u, pvars + 0x04u, pvars + 0x08u,
-                                pvars + 0x10u, pvars + 0x14u, pvars + 0x18u, pvars + 0x1Cu,
-                                pvars + kNanotechGroundVelocity,
-                                pvars + 0x70u, pvars + 0x74u, pvars + 0x78u
-                            };
-                            pause_policy::with_restored_guest_words(
-                                held,
-                                [&](std::uint32_t addr) {
-                                    return memory.read<std::uint32_t>(addr);
-                                },
-                                [&](std::uint32_t addr, std::uint32_t value) {
-                                    memory.write<std::uint32_t>(addr, value);
-                                },
-                                [&] {
-                                    memory.write<std::uint32_t>(primary_addr, 0u);
-                                    memory.write<float>(pvars + kNanotechGroundVelocity, 0.0f);
-                                    pause_policy::with_stopped_motion_clocks(
-                                        [&] { return memory.read<float>(time_addr); },
-                                        [&](float v) { memory.write<float>(time_addr, v); },
-                                        [&] { return memory.read<float>(sq_addr); },
-                                        [&](float v) { memory.write<float>(sq_addr, v); },
-                                        [&] { original(moby); });
-                                });
-                            ++nanotech_detached_glow_count;
-                            if (!nanotech_first_detached_refresh_logged) {
-                                game_mod->info("Detached Nanotech halo particles refreshed with pickup and motion suppressed");
-                                nanotech_first_detached_refresh_logged = true;
-                            }
-                            return;
-                        }
-                        pause_policy::with_preserved_motion_pair(
-                            [&] { return memory.read<float>(pvars + kNanotechBobOffset); },
-                            [&](float value) {
-                                memory.write<float>(pvars + kNanotechBobOffset, value);
-                            },
-                            [&] { return memory.read<float>(pvars + kNanotechBobPhase); },
-                            [&](float value) {
-                                memory.write<float>(pvars + kNanotechBobPhase, value);
-                            },
-                            [&] {
-                                pause_policy::with_stopped_motion_clocks(
-                                    [&] { return memory.read<float>(time_addr); },
-                                    [&](float value) { memory.write<float>(time_addr, value); },
-                                    [&] { return memory.read<float>(sq_addr); },
-                                    [&](float value) { memory.write<float>(sq_addr, value); },
-                                    [&] { original(moby); });
-                            });
-                        ++nanotech_attached_glow_count;
-                        if (!nanotech_first_particle_refresh_logged) {
-                            game_mod->info("Nanotech crate halo particles refreshed with orb motion held");
-                            nanotech_first_particle_refresh_logged = true;
-                        }
-                    });
-            });
-        nanotech_draw_hook = true;
-        mod.info("Nanotech attached/detached halo hook registered with guarded pickup suppression (class 806)");
-    } catch (const openrac::Error&) {
-        mod.warn("Nanotech orb hook unavailable; health boxes stay paused without glow");
-    }
-
-    // A paired yellow Swingshot target is a class-803 moby whose state-1
-    // update replenishes the glowing particle connection. It has no separate
-    // draw callback. Allow only that update under zero movement clocks so
-    // the target cannot steer toward Ratchet while the wheel is open.
-    // Existing free particles may still move/fade; in-game testing is needed.
-    try {
-        mod.hook<openrac::rac1::Moby_SwingshotVersatarget_Update>(
-            [](auto original, std::uint32_t moby) {
-                if (moby == 0) {
-                    original(moby);
-                    return;
-                }
-                const auto memory = game_mod->memory();
-                const auto oclass = memory.read<std::int16_t>(moby + kMobyClass);
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const bool preserve_glow = pause_policy::should_route_paired_swingshot_glow(
-                    wheel_active, keep_water, world_gate, paired_target_effect_hook,
-                    oclass, state);
-                if (!preserve_glow) {
-                    original(moby);
-                    return;
-                }
-
-                const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                if (pvars == 0) {
-                    return; // A target in state 1 should always be initialized.
-                }
-
-                const auto clocks = pause_policy::paired_swingshot_motion_clock_addresses(
-                    game_mod->version() == "pal");
-                const auto time_addr = game_mod->relocate(clocks.frame_time);
-                const auto sq_addr = game_mod->relocate(clocks.frame_time_squared);
-                if (time_addr == 0 || sq_addr == 0) {
-                    if (!paired_target_missing_clocks_warned) {
-                        game_mod->warn("Paired Swingshot motion clocks unavailable; target stays frozen without particles");
-                        paired_target_missing_clocks_warned = true;
-                    }
-                    return;
-                }
-                auto clock_memory = game_mod->memory();
-                pause_policy::with_preserved_motion_pair(
-                    [&] { return clock_memory.read<float>(moby + kMobyYaw); },
-                    [&](float value) { clock_memory.write<float>(moby + kMobyYaw, value); },
-                    [&] { return clock_memory.read<float>(pvars + kPairedTargetSteeringVelocity); },
-                    [&](float value) {
-                        clock_memory.write<float>(pvars + kPairedTargetSteeringVelocity, value);
-                    },
-                    [&] {
-                        pause_policy::with_stopped_motion_clocks(
-                            [&] { return clock_memory.read<float>(time_addr); },
-                            [&](float value) { clock_memory.write<float>(time_addr, value); },
-                            [&] { return clock_memory.read<float>(sq_addr); },
-                            [&](float value) { clock_memory.write<float>(sq_addr, value); },
-                            [&] { original(moby); });
-                    });
-                if (!paired_target_first_effect_logged) {
-                    game_mod->info("Paired Swingshot glow particle update held at zero motion time");
-                    paired_target_first_effect_logged = true;
-                }
-            });
-        paired_target_effect_hook = true;
-        mod.info("Paired Swingshot yellow-glow hook registered (class 803)");
-    } catch (const openrac::Error&) {
-        mod.warn("Paired Swingshot hook unavailable; yellow target particles remain paused");
-    }
-
-    // Kalebo III's doorway wall (class 552 / 0x228) is rendered by the
-    // linked-pair ribbons controller. The active group's state-1 update
-    // registers the four horizontal quads; the surrounding wall and switch
-    // logic remain gated. Never run its state-0 linking/initialization or
-    // follower updates during Quick Select.
-    try {
-        mod.hook<openrac::rac1::Moby_Class552_Update>(
-            [](auto original, std::uint32_t moby) {
-                if (!wheel_active || !world_gate) {
-                    original(moby);
-                    return;
-                }
-                if (moby == 0) {
-                    return;
-                }
-
-                auto memory = game_mod->memory();
-                const auto oclass = memory.read<std::int16_t>(moby + kMobyClass);
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const auto flags = memory.read<std::uint16_t>(moby + kMobyFlags);
-                if (!pause_policy::should_route_kalebo_wall_ribbons(
-                        wheel_active, keep_water, world_gate, kalebo_wall_ribbon_hook,
-                        game_mod->loaded_level(), oclass, state, flags)
-                    || memory.read<std::uint32_t>(moby + kMobyPvars) == 0) {
-                    return;
-                }
-
-                // State 1 does not advance motion/collision: it queues the
-                // ribbon draw callback and maintains its ambient audio.
-                original(moby);
-                ++kalebo_wall_ribbon_refresh_count;
-                if (!kalebo_wall_first_refresh_logged) {
-                    game_mod->info("Kalebo doorway wall ribbon draw refreshed while world is paused");
-                    kalebo_wall_first_refresh_logged = true;
-                }
-            });
-        kalebo_wall_ribbon_hook = true;
-        mod.info("Kalebo linked-pair ribbon wall hook registered (class 552)");
-    } catch (const openrac::Error&) {
-        mod.warn("Kalebo class 552 hook unavailable; doorway ribbons remain paused");
-    }
-
-    // Veldin Orbit (Drek's Fleet) class 99 draws its red laser beams from
-    // pvars endpoints, but its normal update also moves the beam, performs
-    // collision/hit checks and emits particles. During Quick Select only
-    // enqueue the precomputed quad: no original() while the world is gated.
-    try {
-        mod.hook<openrac::rac1::Moby_Class99_Update>(
-            [](auto original, std::uint32_t moby) {
-                if (!wheel_active || !world_gate) {
-                    original(moby);
-                    return;
-                }
-                if (moby == 0) {
-                    return;
-                }
-                auto memory = game_mod->memory();
-                const auto oclass = memory.read<std::int16_t>(moby + kMobyClass);
-                if (!pause_policy::should_route_fleet_laser_draw(
-                        wheel_active, keep_water, world_gate, fleet_laser_draw_hook,
-                        game_mod->loaded_level(), oclass)) {
-                    return;
-                }
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                const auto width = pvars == 0 ? 0.0f
-                    : memory.read<float>(pvars + kFleetLaserWidth);
-                if (!pause_policy::can_draw_fleet_laser(state, pvars, width)) {
-                    return; // No initialized endpoints, or the beam is off.
-                }
-
-                const bool pal = game_mod->version() == "pal";
-                const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                    pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                    pause_policy::fleet_laser_draw_code_address(pal));
-                if (add == nullptr || draw == nullptr) {
-                    if (!fleet_laser_missing_draw_warned) {
-                        game_mod->warn("Veldin Orbit laser draw callback unavailable; hit-test update remains frozen");
-                        fleet_laser_missing_draw_warned = true;
-                    }
-                    return;
-                }
-                pause_policy::enqueue_fleet_laser(pal, moby, add);
-                ++fleet_laser_draw_count;
-                if (!fleet_laser_first_draw_logged) {
-                    game_mod->info("Veldin Orbit laser beams drawn while motion and hit tests stay paused");
-                    fleet_laser_first_draw_logged = true;
-                }
-            });
-        fleet_laser_draw_hook = true;
-        mod.info("Veldin Orbit class-99 laser draw-only hook registered");
-    } catch (const openrac::Error&) {
-        mod.warn("Veldin Orbit class-99 hook unavailable; lasers remain paused");
-    }
-
-    // Veldin Orbit's huge blue-white beam and purple impact glow are a
-    // separate distant-fleet backdrop renderer on class 1772. Its ordinary
-    // update also animates the quad phases and adjusts the hero fall state.
-    // During Quick Select, queue only its original rendering callback using
-    // the precomputed endpoints, with no gameplay or scene-state update.
-    try {
-        mod.hook<openrac::rac1::Moby_Class1772_Update>(
-            [](auto original, std::uint32_t moby) {
-                if (!wheel_active || !world_gate) {
-                    original(moby);
-                    return;
-                }
-                if (moby == 0) {
-                    return;
-                }
-                auto memory = game_mod->memory();
-                const auto oclass = memory.read<std::int16_t>(moby + kMobyClass);
-                if (!pause_policy::should_route_fleet_backdrop_draw(
-                        wheel_active, keep_water, world_gate, fleet_backdrop_draw_hook,
-                        game_mod->loaded_level(), oclass)) {
-                    return;
-                }
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                if (!pause_policy::can_draw_fleet_backdrop(state, pvars)) {
-                    return;
-                }
-
-                const bool pal = game_mod->version() == "pal";
-                const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                    pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                    pause_policy::fleet_backdrop_draw_code_address(pal));
-                if (add == nullptr || draw == nullptr) {
-                    if (!fleet_backdrop_missing_draw_warned) {
-                        game_mod->warn("Veldin Orbit fleet-backdrop callback unavailable; scene update stays paused");
-                        fleet_backdrop_missing_draw_warned = true;
-                    }
-                    return;
-                }
-                pause_policy::enqueue_fleet_backdrop(pal, moby, add);
-                ++fleet_backdrop_draw_count;
-                if (!fleet_backdrop_first_draw_logged) {
-                    game_mod->info("Veldin Orbit distant beam and impact-glow quads drawn while fleet animation stays paused");
-                    fleet_backdrop_first_draw_logged = true;
-                }
-            });
-        fleet_backdrop_draw_hook = true;
-        mod.info("Veldin Orbit class-1772 fleet backdrop draw-only hook registered");
-    } catch (const openrac::Error&) {
-        mod.warn("Veldin Orbit class-1772 hook unavailable; distant beam remains paused");
-    }
-
-    // Veldin Orbit's left doorway spark field is class 78: its normal update
-    // emits particles, checks linked state and queues its mesh renderer.
-    // The right exterior vacuum-looking veil uses class 1378: its update
-    // writes Ratchet's updraft state before queueing animated layers.
-    // Hook each class independently and refresh only the visual callback.
-    try {
-        mod.hook<openrac::rac1::Moby_Class78_Update>(
-            [](auto original, std::uint32_t moby) {
-                refresh_veldin_orbit_doorway(original, moby);
-            });
-        veldin_orbit_spark_draw_hook = true;
-        mod.info("Veldin Orbit class-78 doorway spark-field draw-only hook registered");
-    } catch (const openrac::Error&) {
-        mod.warn("Veldin Orbit class-78 hook unavailable; spark field remains paused");
-    }
-
-    try {
-        mod.hook<openrac::rac1::Moby_Class1378_Update>(
-            [](auto original, std::uint32_t moby) {
-                refresh_veldin_orbit_doorway(original, moby);
-            });
-        veldin_orbit_airflow_draw_hook = true;
-        mod.info("Veldin Orbit class-1378 exterior air-flow draw-only hook registered");
-    } catch (const openrac::Error&) {
-        mod.warn("Veldin Orbit class-1378 hook unavailable; air-flow veil remains paused");
-    }
-
-    // Final Veldin's green Trespasser barriers are class 1392. Their active
-    // update queues a glow renderer but can also unlock collision and stop
-    // sounds when the linked Trespasser pad opens. Never execute that update
-    // while the world is frozen: keep just its initialized quad rendering.
-    try {
-        mod.hook<openrac::rac1::Moby_Class1392_Update>(
-            [](auto original, std::uint32_t moby) {
-                if (!wheel_active || !world_gate) {
-                    original(moby);
-                    return;
-                }
-                if (moby == 0) {
-                    return;
-                }
-                auto memory = game_mod->memory();
-                const auto oclass = memory.read<std::int16_t>(moby + kMobyClass);
-                if (!pause_policy::should_route_veldin_final_barrier_draw(
-                        wheel_active, keep_water, world_gate, veldin_final_barrier_draw_hook,
-                        game_mod->loaded_level(), oclass)) {
-                    return;
-                }
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                if (!pause_policy::can_draw_veldin_final_barrier(state, pvars)) {
-                    return;
-                }
-
-                const bool pal = game_mod->version() == "pal";
-                const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                    pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                    pause_policy::veldin_final_barrier_draw_code_address(pal));
-                if (add == nullptr || draw == nullptr) {
-                    if (!veldin_final_barrier_missing_draw_warned) {
-                        game_mod->warn("Final Veldin barrier draw callback unavailable; collision stays paused");
-                        veldin_final_barrier_missing_draw_warned = true;
-                    }
-                    return;
-                }
-                pause_policy::enqueue_veldin_final_barrier(pal, moby, add);
-                ++veldin_final_barrier_draw_count;
-                if (!veldin_final_barrier_first_draw_logged) {
-                    game_mod->info("Final Veldin green Trespasser barrier drawn while pad/collision updates stay frozen");
-                    veldin_final_barrier_first_draw_logged = true;
-                }
-            });
-        veldin_final_barrier_draw_hook = true;
-        mod.info("Final Veldin class-1392 Trespasser barrier draw-only hook registered");
-    } catch (const openrac::Error&) {
-        mod.warn("Final Veldin class-1392 hook unavailable; green barrier remains paused");
-    }
-
-    // Final Veldin's class-1402 lift also renders the large textured shaft
-    // meshes. The normal update moves the lift and linked scenery, updates
-    // commands and scrolls one mesh's UVs, so never execute it mid-pause.
-    // Its pvars+0x14 selector chooses one of three game draw callbacks.
-    try {
-        mod.hook<openrac::rac1::Moby_Class1402_Update>(
-            [](auto original, std::uint32_t moby) {
-                if (!wheel_active || !world_gate) {
-                    original(moby);
-                    return;
-                }
-                if (moby == 0) {
-                    return;
-                }
-                auto memory = game_mod->memory();
-                const auto oclass = memory.read<std::int16_t>(moby + kMobyClass);
-                if (!pause_policy::should_route_veldin_final_lift_draw(
-                        wheel_active, keep_water, world_gate, veldin_final_lift_draw_hook,
-                        game_mod->loaded_level(), oclass)) {
-                    return;
-                }
-                const auto state = memory.read<std::uint8_t>(moby + kMobyState);
-                const auto pvars = memory.read<std::uint32_t>(moby + kMobyPvars);
-                if (pvars == 0) {
-                    return;
-                }
-                const auto mesh_mode = memory.read<std::int32_t>(pvars + 0x14u);
-                if (!pause_policy::can_draw_veldin_final_lift(state, pvars, mesh_mode)) {
-                    return;
-                }
-
-                const bool pal = game_mod->version() == "pal";
-                const auto add = game_mod->function_at<GameAddDrawCallbackFn>(
-                    pal ? kPalAddDrawCallback : kNtscAddDrawCallback);
-                const auto draw = game_mod->function_at<GameDrawEffectFn>(
-                    pause_policy::veldin_final_lift_draw_code_address(pal, mesh_mode));
-                if (add == nullptr || draw == nullptr) {
-                    if (!veldin_final_lift_missing_draw_warned) {
-                        game_mod->warn("Final Veldin shaft mesh callback unavailable; lift stays frozen");
-                        veldin_final_lift_missing_draw_warned = true;
-                    }
-                    return;
-                }
-                pause_policy::enqueue_veldin_final_lift(pal, mesh_mode, moby, add);
-                ++veldin_final_lift_draw_count;
-                if (!veldin_final_lift_first_draw_logged) {
-                    game_mod->info("Final Veldin class-1402 shaft mesh drawn with lift movement paused (mode="
-                                   + std::to_string(mesh_mode) + ")");
-                    veldin_final_lift_first_draw_logged = true;
-                }
-            });
-        veldin_final_lift_draw_hook = true;
-        mod.info("Final Veldin class-1402 lift/shaft draw-only hook registered");
-    } catch (const openrac::Error&) {
-        mod.warn("Final Veldin class-1402 hook unavailable; shaft mesh remains paused");
-    }
-
-    try {
-        mod.on_moby_update(gate_moby_update);
-        world_gate = true;
-    } catch (const openrac::Error&) {
-        world_gate = false;
-    }
-
-    if (soften_background) {
-        bool modern_overlay_registered = false;
-#if OPENRAC_MOD_API_MINOR >= 14
-        modern_overlay_registered = mod.on_overlay(draw_background_softening);
-        if (modern_overlay_registered) {
-            mod.info("background softening overlay registered (OpenRAC API 1.14)");
-        } else {
-            mod.info("OpenRAC overlay API unavailable; trying RAC1's own screen-rectangle renderer");
-        }
-#endif
-        if (!modern_overlay_registered) {
-            // API 1.12 has no port overlay, but RAC1 itself has a coloured
-            // screen-rectangle draw routine. Insert its packet just before
-            // the quick-select HUD draws, so wheel icons remain on top.
-            // Optional and isolated: if the hook is taken, pause still works.
-            try {
-                mod.hook<openrac::rac1::Hud_QuickSelect_Draw>(
-                    [](auto original, std::uint32_t panel) -> std::int32_t {
-                        if (wheel_active && soften_background) {
-                            if (legacy_draw_rect == nullptr) {
-                                legacy_draw_rect = game_mod->function_at<GameDrawRectFn>(
-                                    pause_legacy_shade::game_rect_address(
-                                        game_mod->version() == "pal"));
-                                if (legacy_draw_rect == nullptr
-                                    && !legacy_draw_rect_warning_logged) {
-                                    game_mod->warn("RAC1 screen-rectangle function unavailable; background softening skipped");
-                                    legacy_draw_rect_warning_logged = true;
-                                }
-                            }
-                            if (pause_legacy_shade::should_draw(
-                                    wheel_active, soften_background,
-                                    legacy_draw_rect != nullptr)) {
-                                legacy_draw_rect(
-                                    0, pause_legacy_shade::kPictureHeight,
-                                    0, pause_legacy_shade::kPictureWidth,
-                                    pause_legacy_shade::colour_for_strength(
-                                        background_softening_strength));
-                                if (!legacy_first_draw_logged) {
-                                    game_mod->info("RAC1 background tint: first draw call made");
-                                    legacy_first_draw_logged = true;
-                                }
-                            }
-                        }
-                        return original(panel);
-                    });
-                mod.info("RAC1 HUD-background tint hook registered (API 1.12 compatible)");
-            } catch (const openrac::Error&) {
-                mod.warn("RAC1 HUD tint hook unavailable; world pause remains active");
-            }
-        }
-    }
-
-    mod.on_frame([] {
-        // The water renderer is queued by the primary controller, not once
-        // for each of the 41+ visible class-831 mobys this level may contain.
-        blackwater_water_draw_limiter.reset();
-        if (!wheel_seen_this_tick) {
-            wheel_active = false;
-            wheel_visible_for_overlay.store(false, std::memory_order_relaxed);
-            restore_animations();
-            report_pause_diagnostics();
-        }
-
-        if (vendor_brightness.active) {
-            const int level = game_mod->loaded_level();
-            const auto array_base = current_moby_array();
-            if (!wheel_active || !keep_water || !world_gate || !vendor_draw_hook
-                || vendor_brightness.level != level
-                || vendor_brightness.array_base != array_base) {
-                // Restoring the glow on a reused slot would corrupt an
-                // unrelated moby, so compare all original identifiers.
-                if (vendor_brightness.level == level
-                    && vendor_brightness.array_base == array_base
-                    && is_moby_in_active_array(vendor_brightness.moby, array_base)) {
-                    auto memory = game_mod->memory();
-                    const auto old_moby = vendor_brightness.moby;
-                    if (memory.read<std::int16_t>(old_moby + kMobyClass) == 11) {
-                        vendor_brightness.restore(
-                            level, array_base, old_moby,
-                            memory.read<std::uint64_t>(old_moby + kMobySpawnFrame),
-                            memory.read<std::uint32_t>(old_moby + kMobyPvars),
-                            [&](float glow) {
-                                memory.write<float>(vendor_brightness.pvars
-                                                    + kVendorGlowStrength, glow);
-                            });
-                    }
-                }
-                vendor_brightness.reset();
-            }
-        }
-
-        if (vendor_phases.active) {
-            const int level = game_mod->loaded_level();
-            if (vendor_phases.level != level) {
-                vendor_phases.reset();
-            } else {
-                const auto addresses = pause_policy::vendor_phase_addresses(
-                    game_mod->version() == "pal");
-                const auto sparkle = game_mod->relocate(addresses.sparkle_uv);
-                const auto glow = game_mod->relocate(addresses.glow);
-                if (sparkle == 0 || glow == 0) {
-                    vendor_phases.reset();
-                } else {
-                    auto memory = game_mod->memory();
-                    vendor_phases.restore(level, [&](float uv, float phase) {
-                        memory.write<float>(sparkle, uv);
-                        memory.write<float>(glow,
-                            wheel_active && keep_water && world_gate && vendor_draw_hook
-                                ? pause_policy::vendor_full_glow_alpha_phase()
-                                : phase);
-                    });
-                    if (!wheel_active || !keep_water || !world_gate || !vendor_draw_hook) {
-                        vendor_phases.reset();
-                    }
-                }
-            }
-        }
-        wheel_seen_this_tick = false;
-    });
-
-    mod.info(world_gate
-                 ? "weapon wheel pause: world updates gated; animation/scenery options active"
-                 : "weapon wheel pause: Ratchet only; another mod owns the world gate");
+    mod.info("Weapon Wheel Pause: Going Commando's quick select on Triangle (its own code)");
 }
 
-} // namespace
+}  // namespace
 
-OPENRAC_MOD_CPP("weapon-wheel-pause", "1.0.3", load)
+OPENRAC_MOD_CPP("weapon-wheel-pause", "2.0.0", load)

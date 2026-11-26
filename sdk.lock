@@ -1,5 +1,6 @@
 {
-  "version": "1.14.6",
-  "url": "https://github.com/OpenRAC/OpenRAC/releases/download/sdk-v1.14.6/openrac-mod-sdk-1.14.6.zip",
-  "sha256": "d10450b719a96f17744bb5cdf77db0817a5bd0bafe5e3bbeb45df0dbe2bdb6bc"
+  "about": "The OpenRAC mod SDK this mod builds against: tools/fetch_sdk.py puts it in .sdk/, where CMakeLists.txt finds it. The mod needs three hook points no OpenRAC release has yet (rac1.level.update_play, rac1.freeze.update, rac1.freeze.draw): it is the SDK's source at OpenRAC's develop commit that added them (pull request #863, interface 1.39). Back to a release's url and sha256 once one has them.",
+  "version": "1.39.0",
+  "git": "https://github.com/OpenRAC/OpenRAC",
+  "commit": "be0351ce30e3f845150e843fae6ac6020d4152f7"
 }

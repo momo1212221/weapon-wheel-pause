@@ -34,7 +34,7 @@ class ReleasePreflight(unittest.TestCase):
             self.sdk,
         ))
         installed_hook_types = set(re.findall(
-            r'mod\.hook<openrac::rac1::(\w+)>', self.source,
+            r'mod\.hook<(?:openrac::)?rac1::(\w+)>', self.source,
         ))
         self.assertTrue(installed_hook_types, "Must discover the actual mod hooks")
         unknown = installed_hook_types - set(sdk_ids)

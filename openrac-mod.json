@@ -2,11 +2,12 @@
   "format": 2,
   "id": "weapon-wheel-pause",
   "name": "Weapon Wheel Pause",
-  "version": "1.0.3",
-  "author": "Moritz Wallinger and glawks",
-  "description": "Pause RAC1 during Quick Select while preserving water, scenery and visual effects, with animation freezing and configurable background shading.",
-  "license": "MIT",
-  "api": "1.12",
+  "version": "2.0.0",
+  "author": "Moritz Wallinger, glawks and Henning Berge",
+  "description": "Pause Ratchet & Clank while choosing a weapon, with Going Commando's own quick select code: hold Triangle and the world holds (Going Commando's pause, no freeze dialog) while the stick or the d-pad picks a weapon, with Going Commando's ammo and name text; let go to equip it. A double tap is the quick swap. Ratchet & Clank's own ring, icons, names and slots. Going Commando's black bars are left out, and by default Triangle is held a little longer than in Going Commando before the pause (a setting). Needs OpenRAC with mod interface 1.39 and the hook points rac1.level.update_play, rac1.freeze.update and rac1.freeze.draw.",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/momo1212221/weapon-wheel-pause",
+  "api": "1.39",
   "games": {
     "rac1": [
       "pal",
@@ -14,67 +15,54 @@
     ]
   },
   "hooks": [
-    "rac1.player.update",
+    "rac1.level.update_play",
+    "rac1.freeze.update",
+    "rac1.freeze.draw",
+    "rac1.hud.quick_select.init",
     "rac1.hud.quick_select.update",
-    "rac1.hud.quick_select.draw",
-    "rac1.moby.water_surface.update",
-    "rac1.moby.moby1901.update",
-    "rac1.moby.class_655.update",
-    "rac1.moby.light_beam.update",
-    "rac1.moby.nanotech_ball.update",
-    "rac1.moby.hideable_flower.update",
-    "rac1.moby.moby552.update",
-    "rac1.moby.moby99.update",
-    "rac1.moby.fleet_reflection.update",
-    "rac1.moby.moby78.update",
-    "rac1.moby.moby1378.update",
-    "rac1.moby.moby1392.update",
-    "rac1.moby.moby1402.update"
+    "rac1.hud.quick_select.draw"
+  ],
+  "conflicts": [
+    {
+      "id": "pause-weapon-wheel",
+      "reason": "the earlier Pause Weapon Wheel: both replace the quick select (rac1.hud.quick_select.*) and pause the game while it is open"
+    }
   ],
   "settings": [
     {
-      "key": "freeze_animations",
-      "name": "Freeze enemy animations",
+      "key": "pause",
+      "name": "Pause while open",
       "type": "bool",
       "default": true,
-      "description": "Set the game's animation-skip bit on mobys whose gameplay update is paused."
+      "description": "Going Commando's option: the world holds while the quick select is open (its game mode 4). Off: it opens over the running game, from Ratchet & Clank's own Triangle."
     },
     {
-      "key": "keep_water",
-      "name": "Keep water and scenery drawing",
-      "type": "bool",
-      "default": true,
-      "description": "Preserve water, mud, ship glass and visual effects including vendor glow, Nanotech orbs, Swingshot particles, Kalebo ribbons, Veldin Orbit lasers, fleet backdrop and final Veldin barriers."
+      "key": "open_delay",
+      "name": "Hold before pausing",
+      "type": "choice",
+      "default": "little_longer",
+      "choices": [
+        {
+          "value": "going_commando",
+          "name": "Going Commando"
+        },
+        {
+          "value": "little_longer",
+          "name": "A little longer"
+        },
+        {
+          "value": "longer",
+          "name": "Longer"
+        }
+      ],
+      "description": "How long Triangle is held before the quick select pauses the game. Going Commando: its own 4 frames (a 15th of a second); a natural tap is often that long, so running and double-tap swapping pause briefly. A little longer (the default, longer than Going Commando's): 8 frames, so taps and double taps usually do not pause. Longer: 12 frames. On PAL each is scaled to its 50 ticks a second (3, 7, 10)."
     },
     {
-      "key": "hold_hoven_scroll",
-      "name": "Freeze Hoven water scrolling",
-      "type": "bool",
-      "default": true,
-      "description": "Temporarily stop the game frame clock during Hoven's class 1901 update so the surface stays visible but its scrolling texture stays still."
-    },
-    {
-      "key": "diagnostic_log",
-      "name": "Log pause diagnostics",
+      "key": "click",
+      "name": "Click sound",
       "type": "bool",
       "default": false,
-      "description": "When the weapon wheel closes, log the observed moby classes and which ones were exempted, for investigating missing scenery."
-    },
-    {
-      "key": "soften_background",
-      "name": "Soften background during weapon selection",
-      "type": "bool",
-      "default": true,
-      "description": "Shade the scene beneath the weapon wheel. API 1.12 uses RAC1's own tint renderer; API 1.14+ builds can use a feathered overlay. This is not a Gaussian blur."
-    },
-    {
-      "key": "background_softening_strength",
-      "name": "Background softening strength",
-      "type": "int",
-      "default": 30,
-      "min": 10,
-      "max": 60,
-      "description": "Strength of the translucent shade in percent. Changes take effect after restarting the game."
+      "description": "A sound as the selection moves, where Going Commando clicks. Ratchet & Clank's quick select is silent and has no UI click: on, it plays the level's sound bank's first entry (the one a help message opens with), a stand-in, not Going Commando's sound. Off (the default) keeps Ratchet & Clank's silence."
     }
   ]
 }
