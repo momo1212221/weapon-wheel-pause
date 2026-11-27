@@ -718,6 +718,44 @@ void test_fades_and_commit() {
     CHECK_EQ(f.rd<std::int32_t>(f.d.ammo + 4 * 0x10), 40);
 }
 
+void test_eqs_paused_page_commit() {
+    Fake f;
+    set_up(f, true, true);
+    unsigned begins = 0, ends = 0;
+    bool second = false;
+    gc::shim().game.eqs_page = [&](uint32_t event, uint32_t held, eqs_wheel_page_v2* out) -> int {
+        if (event == EQS_WHEEL_END) { ++ends; return 1; }
+        if (!out) return 0;
+        if (event == EQS_WHEEL_BEGIN) { ++begins; second = false; }
+        if (event == EQS_WHEEL_UPDATE && (held & 0x08)) second = true;
+        out->page_count = 2;
+        out->page_index = second ? 1 : 0;
+        // Slot 2 has a different weapon than the native page.
+        out->native_ids[2] = 0x11;
+        return 1;
+    };
+    const auto canonical = f.rd<std::int32_t>(f.d.slot_items + 8);
+    CHECK_EQ(canonical, 0x12);
+    hold_until_freeze(f);
+    for (int i = 0; i < 12; ++i) freeze(f, 0x10);
+    CHECK_EQ(begins, 1u);
+    freeze(f, 0x10 | 0x08);
+    freeze(f, 0x10 | 0x2000);
+    for (int i = 0; i < 12; ++i) freeze(f, 0x10);
+    CHECK_EQ(selected(f), 2);
+    CHECK_EQ(f.rd<std::int32_t>(f.d.slot_items + 8), canonical);
+    CHECK_EQ(f.rd<std::int32_t>(f.d.page0_entries + 2*28 + 0x18), canonical);
+    f.texts.clear();
+    gc::shim().selector_draw(kRecord);
+    CHECK(!f.texts.empty() && f.texts.back().text == "L1  PAGE 2 / 2  R1");
+    for (int i = 0; i < 20 && gc::shim().in_wheel_freeze(); ++i) freeze(f, 0);
+    for (int i = 0; i < 12; ++i) play(f, 0);
+    CHECK_EQ(f.rd<std::int32_t>(f.d.hero + gcw::kHeroPendingItem), 0x11);
+    CHECK_EQ(f.rd<std::int32_t>(f.d.slot_items + 8), canonical);
+    CHECK_EQ(ends, 1u);
+    gc::shim().game.eqs_page = {};
+}
+
 void test_draw() {
     Fake f;
     set_up(f, true, false);
@@ -1386,6 +1424,7 @@ int main() {
     test_dpad_neighbours();
     test_fades_and_commit();
     test_draw();
+    test_eqs_paused_page_commit();
     test_paused_path();
     test_gate_conditions();
     test_relocated_game_mode();

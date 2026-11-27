@@ -440,7 +440,9 @@ void Shim::begin_paused(int arg) {
 // modal mode: the copied menu_end (the sounds and the music back on, the pad's history cleared).
 // The layer's watchdog ends it the same way, and says why in the log (a normal end is not logged).
 void Shim::end_paused(const char* reason) {
-    eqs_end();
+    // A normal modal exit precedes the wheel's final fade/commit in play.
+    // Keep its EQS page until the selector itself closes; watchdogs abort it.
+    if (reason != nullptr) eqs_end();
     const Memory& m = game.memory;
     const Disc& a = m_level.at;
     m.write<std::int32_t>(a.game_mode, m.read<std::int32_t>(a.mode_freeze_info + kFreezeSavedMode));
@@ -962,7 +964,7 @@ void Shim::selector_update(std::uint32_t record) {
     CopyScope scope(*this);
     rebuild_pages();
     eqs_wheel_page_v2 page{};
-    eqs_snapshot(EQS_WHEEL_UPDATE, record, page);
+    if (!eqs_snapshot(EQS_WHEEL_UPDATE, record, page)) page = {};
     {
         ScopedEqsPage projection(game, m_level.at, page);
         fill_weapon_table();
@@ -981,6 +983,7 @@ int Shim::selector_draw(std::uint32_t record) {
     rebuild_pages();
     eqs_wheel_page_v2 page{};
     const bool supplied = eqs_snapshot(EQS_WHEEL_DRAW, record, page);
+    if (!supplied) page = {};
     ScopedEqsPage projection(game, m_level.at, page);
     fill_weapon_table();
     const int result = weapon_wheel_draw(reinterpret_cast<char*>(m.at(record)));
