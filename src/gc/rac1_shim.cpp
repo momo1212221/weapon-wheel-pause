@@ -7,6 +7,7 @@
 #include "rac1_shim.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -137,6 +138,7 @@ void Shim::set_options(bool pause, bool click, int open_delay_frames) {
 bool Shim::pause() const { return gc_shim_options[3] != 0; }
 
 void Shim::reset() {
+    eqs_end();
     m_copy_depth = 0;
     m_entered = false;
     m_refused.clear();
@@ -438,6 +440,7 @@ void Shim::begin_paused(int arg) {
 // modal mode: the copied menu_end (the sounds and the music back on, the pad's history cleared).
 // The layer's watchdog ends it the same way, and says why in the log (a normal end is not logged).
 void Shim::end_paused(const char* reason) {
+    eqs_end();
     const Memory& m = game.memory;
     const Disc& a = m_level.at;
     m.write<std::int32_t>(a.game_mode, m.read<std::int32_t>(a.mode_freeze_info + kFreezeSavedMode));
@@ -854,6 +857,70 @@ void Shim::freeze_draw(const std::function<void()>& original) {
     gfx_render_frame_extra_layers();
 }
 
+// The provider returns native item IDs only. Use host-side copies of the eight
+// entries and assignment array, never change canonical game/save memory.
+namespace {
+class ScopedEqsPage {
+    void* saved_entries = nullptr;
+    void* saved_items = nullptr;
+    std::array<std::array<std::int32_t,7>,8> entries{};
+    std::array<std::int32_t,8> items{};
+    bool active = false;
+public:
+    ScopedEqsPage(const gcw::gc::Game& game, const gcw::Disc& a, const eqs_wheel_page_v2& page) {
+        if (page.page_index == 0 || page.page_index >= page.page_count || page.page_count > 8 ||
+            !gc_shim_pages[0] || !gc_shim_slot_items ||
+            game.memory.read<std::int32_t>(a.page) != 0 ||
+            game.memory.read<std::int32_t>(a.slot_count) != 8) return;
+        for (int id : page.native_ids) if (id < 0 || id > 39) return;
+        std::memcpy(entries.data(), gc_shim_pages[0], sizeof entries);
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const auto id = page.native_ids[i];
+            items[i] = id;
+            entries[i][6] = id;
+            entries[i][0] = id == 0 ? 0 : game.memory.read<std::uint16_t>(
+                a.item_defs + static_cast<std::uint32_t>(id) * gcw::kItemDefStride + gcw::kItemDefIcon);
+        }
+        saved_entries = gc_shim_pages[0];
+        saved_items = gc_shim_slot_items;
+        gc_shim_pages[0] = entries.data();
+        gc_shim_slot_items = items.data();
+        active = true;
+    }
+    ~ScopedEqsPage() {
+        if (active) { gc_shim_pages[0] = saved_entries; gc_shim_slot_items = saved_items; }
+    }
+    ScopedEqsPage(const ScopedEqsPage&) = delete;
+    ScopedEqsPage& operator=(const ScopedEqsPage&) = delete;
+    bool applied() const { return active; }
+};
+}
+
+void Shim::eqs_begin(std::uint32_t record) {
+    eqs_end();
+    if (!game.eqs_page) return;
+    eqs_wheel_page_v2 page{};
+    page.size = sizeof(page);
+    const auto held = game.memory.read<std::uint32_t>(m_level.at.pad + kPadHeldUnmasked);
+    if (game.eqs_page(EQS_WHEEL_BEGIN, held, &page)) {
+        m_eqs_active = true;
+        m_eqs_record = record;
+        log_once("eqs bridge", "Expanded Quick Select page provider connected");
+    }
+}
+void Shim::eqs_end() {
+    if (m_eqs_active && game.eqs_page) game.eqs_page(EQS_WHEEL_END, 0, nullptr);
+    m_eqs_active = false;
+    m_eqs_record = 0;
+}
+bool Shim::eqs_snapshot(uint32_t event, std::uint32_t record, eqs_wheel_page_v2& page) {
+    if (!m_eqs_active || m_eqs_record != record || !game.eqs_page) return false;
+    page.size = sizeof(page);
+    const auto held = game.memory.read<std::uint32_t>(m_level.at.pad + kPadHeldUnmasked);
+    return game.eqs_page(event, held, &page) && page.page_count >= 1 &&
+           page.page_count <= 8 && page.page_index < page.page_count;
+}
+
 // rac1.hud.quick_select.init: Going Commando's menu_init_panel_layout (with weapon_menu_init_slots).
 // With "Pause while open" on, a record Ratchet & Clank's own Triangle opened (not the mod's freeze)
 // is refused, as Going Commando's decider opens the HUD quick select only with the option off
@@ -869,10 +936,12 @@ void Shim::selector_init(std::uint32_t record) {
     fill_weapon_table();
     if (in_wheel_freeze()) {
         m_record_opened = true;
+        eqs_begin(record);
         log_once("record in freeze", "the paused quick select's HUD record opened");
         return;
     }
     if (!pause()) {
+        eqs_begin(record);
         log_once("record hud", "the game's Triangle opened the quick select over the running game (\"Pause while open\" off)");
         return;
     }
@@ -892,8 +961,15 @@ void Shim::selector_update(std::uint32_t record) {
     }
     CopyScope scope(*this);
     rebuild_pages();
-    fill_weapon_table();
-    weapon_wheel_update_select(m.at(record));
+    eqs_wheel_page_v2 page{};
+    eqs_snapshot(EQS_WHEEL_UPDATE, record, page);
+    {
+        ScopedEqsPage projection(game, m_level.at, page);
+        fill_weapon_table();
+        weapon_wheel_update_select(m.at(record));
+    }
+    // Keep the page through the entire release/fade/commit lifecycle.
+    if (m_eqs_record == record && m.read<std::int32_t>(record + kRecordSlide) == -6) eqs_end();
 }
 
 // rac1.hud.quick_select.draw: Going Commando's weapon_wheel_draw.
@@ -903,8 +979,24 @@ int Shim::selector_draw(std::uint32_t record) {
         return m.read<std::int32_t>(record + kRecordWidth);
     }
     rebuild_pages();
+    eqs_wheel_page_v2 page{};
+    const bool supplied = eqs_snapshot(EQS_WHEEL_DRAW, record, page);
+    ScopedEqsPage projection(game, m_level.at, page);
     fill_weapon_table();
-    return weapon_wheel_draw(reinterpret_cast<char*>(m.at(record)));
+    const int result = weapon_wheel_draw(reinterpret_cast<char*>(m.at(record)));
+    if (supplied && page.page_count > 1 && (page.page_index == 0 || projection.applied()) &&
+        game.font_print_center && game.hud_screen_position) {
+        int x = m.read<std::int32_t>(record + 0x50);
+        int y = m.read<std::int32_t>(record + 0x54);
+        game.hud_screen_position(record, x, y);
+        char label[40];
+        std::snprintf(label, sizeof label, "L1  PAGE %u / %u  R1",
+                      page.page_index + 1, page.page_count);
+        const auto fade = std::min<unsigned>(8, m.read<std::uint8_t>(record + kRecordFades));
+        game.font_print_center(x + 105, y + 190, (fade * 16u << 24) | 0x00f0f0f0u,
+                               label, -1);
+    }
+    return result;
 }
 
 // --- Math: Ratchet & Clank's own by name, or a faithful stand-in ---

@@ -2,7 +2,7 @@
   "format": 2,
   "id": "weapon-wheel-pause",
   "name": "Weapon Wheel Pause",
-  "version": "2.0.0",
+  "version": "2.0.1-dev.1",
   "author": "Moritz Wallinger, glawks and Henning Berge",
   "description": "Pause Ratchet & Clank while choosing a weapon, with Going Commando's own quick select code: hold Triangle and the world holds (Going Commando's pause, no freeze dialog) while the stick or the d-pad picks a weapon, with Going Commando's ammo and name text; let go to equip it. A double tap is the quick swap. Ratchet & Clank's own ring, icons, names and slots. Going Commando's black bars are left out, and by default Triangle is held a little longer than in Going Commando before the pause (a setting). Needs OpenRAC with mod interface 1.39 and the hook points rac1.level.update_play, rac1.freeze.update and rac1.freeze.draw.",
   "license": "GPL-3.0-only",

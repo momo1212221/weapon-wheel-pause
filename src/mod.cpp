@@ -32,6 +32,12 @@
 
 #include "gc/rac1_shim.hpp"
 #include "layout.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -157,6 +163,19 @@ void connect_game(openrac::Mod& mod, bool ntsc) {
     if (const auto f = optional_function<float (*)(int)>(mod, n.int_to_float)) g.int_to_float = f;
     if (const auto f = optional_function<int (*)(float)>(mod, n.float_to_int)) g.float_to_int = f;
 
+    // Discover EQS on demand: either mod may be loaded first.
+    g.eqs_page = [](uint32_t event, uint32_t held, eqs_wheel_page_v2* out) -> int {
+#ifdef _WIN32
+        for (const auto name : {L"expanded_quick_select.dll", L"libexpanded_quick_select.dll"}) {
+            if (const auto module = GetModuleHandleW(name)) {
+                const auto query = reinterpret_cast<eqs_wheel_page_fn>(
+                    GetProcAddress(module, "openrac_eqs_wheel_page_v2"));
+                if (query) return query(event, held, out);
+            }
+        }
+#endif
+        return 0;
+    };
     g.log = [m](const char* what) { m->warn(std::string("Weapon Wheel Pause: ") + what); };
     g.info = [m](const char* what) { m->info(std::string("Weapon Wheel Pause: ") + what); };
 }
@@ -212,4 +231,9 @@ void load(openrac::Mod& mod) {
 
 }  // namespace
 
-OPENRAC_MOD_CPP("weapon-wheel-pause", "2.0.0", load)
+#ifdef _WIN32
+extern "C" __declspec(dllexport) int openrac_weapon_wheel_pause_eqs_bridge() {
+    return g_mod != nullptr;
+}
+#endif
+OPENRAC_MOD_CPP("weapon-wheel-pause", "2.0.1-dev.1", load)

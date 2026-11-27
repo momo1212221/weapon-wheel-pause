@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "../layout.hpp"
+#include "../wheel_bridge.h"
 
 namespace gc_weapon_wheel::gc {
 
@@ -154,6 +155,9 @@ struct Game {
     std::function<float(int)> int_to_float;
     std::function<int(float)> float_to_int;
 
+    // Optional EQS provider, absent in standalone play and fake game tests.
+    std::function<int(uint32_t, uint32_t, eqs_wheel_page_v2*)> eqs_page;
+
     // The session log: a warning, and a line of information.
     std::function<void(const char*)> log;
     std::function<void(const char*)> info;
@@ -252,6 +256,11 @@ private:
         std::uint16_t count = 0;
         std::uint32_t best = 0, levels = 0;
     };
+    void eqs_begin(std::uint32_t record);
+    void eqs_end();
+    bool eqs_snapshot(uint32_t event, std::uint32_t record, eqs_wheel_page_v2& page);
+    bool m_eqs_active = false;
+    std::uint32_t m_eqs_record = 0;
     bool m_pause = true;
     bool m_click = true;
     int m_open_delay = kGcOpenDelay;
